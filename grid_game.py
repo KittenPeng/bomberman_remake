@@ -4,11 +4,23 @@ import math
 import os
 import random
 
+# Helper function to get resource path (works with PyInstaller)
+def resource_path(relative_path):
+    """Get absolute path to resource, works for dev and for PyInstaller"""
+    try:
+        # PyInstaller creates a temp folder and stores path in _MEIPASS
+        base_path = sys._MEIPASS
+    except Exception:
+        base_path = os.path.abspath(".")
+    return os.path.join(base_path, relative_path)
+
 # Initialize Pygame
 pygame.init()
 
-# Initialize mixer for music
-pygame.mixer.init()
+# Initialize mixer for music with more channels for multiple sounds
+pygame.mixer.init(frequency=22050, size=-16, channels=2, buffer=512)
+# Reserve more channels for simultaneous sounds (bounce sounds can overlap)
+pygame.mixer.set_num_channels(16)
 
 # Load sound effects
 place_bomb_sound = None
@@ -16,28 +28,30 @@ bomb_explode_sound = None
 item_get_sound = None
 kick_voice_sound = None
 kick_sound = None
+throw_sound = None
+bomb_bounce_sound = None
 try:
-    place_bomb_sound = pygame.mixer.Sound("Place Bomb.wav")
+    place_bomb_sound = pygame.mixer.Sound(resource_path("Place Bomb.wav"))
 except Exception as e:
     print(f"Warning: Could not load place bomb sound: {e}")
 
 try:
-    bomb_explode_sound = pygame.mixer.Sound("Bomb Explodes.wav")
+    bomb_explode_sound = pygame.mixer.Sound(resource_path("Bomb Explodes.wav"))
 except Exception as e:
     print(f"Warning: Could not load bomb explode sound: {e}")
 
 try:
-    item_get_sound = pygame.mixer.Sound("Item Get.wav")
+    item_get_sound = pygame.mixer.Sound(resource_path("Item Get.wav"))
 except Exception as e:
     print(f"Warning: Could not load item get sound: {e}")
 
 try:
-    kick_voice_sound = pygame.mixer.Sound("kick voice.wav")
+    kick_voice_sound = pygame.mixer.Sound(resource_path("kick voice.wav"))
 except Exception as e:
     print(f"Warning: Could not load kick voice sound: {e}")
 
 try:
-    kick_sound_raw = pygame.mixer.Sound("kick.wav")
+    kick_sound_raw = pygame.mixer.Sound(resource_path("kick.wav"))
     # Pitch down by 1 semitone (ratio = 2^(-1/12) ≈ 0.9439)
     # To pitch down, we need to resample at a slower rate
     try:
@@ -79,12 +93,24 @@ except Exception as e:
     print(f"Warning: Could not load kick sound: {e}")
 
 try:
-    pause_jingle_sound = pygame.mixer.Sound("Pause Jingle.wav")
+    pause_jingle_sound = pygame.mixer.Sound(resource_path("Pause Jingle.wav"))
     # Set volume to be louder (1.0 is max, but we can go higher if needed)
     pause_jingle_sound.set_volume(1.0)
 except Exception as e:
     pause_jingle_sound = None
     print(f"Warning: Could not load pause jingle sound: {e}")
+
+try:
+    throw_sound = pygame.mixer.Sound(resource_path("Throw.wav"))
+except Exception as e:
+    throw_sound = None
+    print(f"Warning: Could not load throw sound: {e}")
+
+try:
+    bomb_bounce_sound = pygame.mixer.Sound(resource_path("Bomb Bounce.wav"))
+except Exception as e:
+    bomb_bounce_sound = None
+    print(f"Warning: Could not load bomb bounce sound: {e}")
 
 # Constants
 GRID_WIDTH = 15
@@ -122,6 +148,8 @@ has_glove = False  # Whether player has the glove powerup
 thrown_bomb = None  # Bomb currently being thrown (None if not throwing)
 is_throwing = False  # Whether player is currently throwing a bomb (prevents movement)
 glove_pickup_animation_start_time = None  # Time when glove pickup animation started (None if not animating)
+glove_pickup_animation_direction = None  # Direction of glove pickup animation ('up', 'right', 'down', 'left')
+glove_pickup_bomb = None  # Bomb being picked up during animation (None if not picking up)
 
 # Powerups on the ground: {(grid_x, grid_y): powerup_type}
 powerups = {}
@@ -266,10 +294,25 @@ class Bomb:
         self.is_moving = False  # Whether bomb is currently being kicked
         self.is_thrown = False  # Whether bomb is currently being thrown (timer paused)
         self.throw_start_time = None  # Time when bomb started being thrown (to track paused duration)
+        self.throw_target_x = None  # Target X position when thrown (pixels)
+        self.throw_target_y = None  # Target Y position when thrown (pixels)
+        self.throw_direction_x = 0  # Direction X when thrown (-1, 0, or 1) for wrapping
+        self.throw_direction_y = 0  # Direction Y when thrown (-1, 0, or 1) for wrapping
         self.can_be_kicked = False  # Whether player has left this bomb's cell at least once
         self.left_time = None  # Timestamp when player left this bomb's cell
         self.step_off_cooldown = 0  # Frames to wait before allowing kick after player steps off
         self.just_started_moving = False  # Flag to track if bomb just started moving this frame
+        self.bounce_offset = 0.0  # Vertical offset for bounce animation (pixels)
+        self.bounce_velocity = 0.0  # Vertical velocity for bounce animation
+        self.bounce_start_time = None  # Time when bounce animation started
+        self.bounced_walls = set()  # Track walls this bomb has already bounced off (grid coordinates)
+        self.initial_target_x = None  # Initial 3-tile target X position (pixels)
+        self.initial_target_y = None  # Initial 3-tile target Y position (pixels)
+        self.reached_initial_target = False  # Whether bomb has reached the initial 3-tile target
+        self.just_wrapped_back_offscreen = False  # Flag to track if bomb just wrapped back after being thrown offscreen
+        self.wrap_back_time = None  # Time when bomb wrapped back onscreen (to delay bounce detection)
+        self.wrap_back_pixel_x = None  # Pixel X position when bomb wrapped back onscreen
+        self.wrap_back_pixel_y = None  # Pixel Y position when bomb wrapped back onscreen
     
     def should_explode(self, current_time):
         # If bomb is being thrown, timer is paused
@@ -334,7 +377,7 @@ try:
     old_stderr = sys.stderr
     sys.stderr = open(os.devnull, 'w')
     try:
-        bomb_sprite_sheet = pygame.image.load("SNES - Super Bomberman 2 - Miscellaneous - Bombs.png")
+        bomb_sprite_sheet = pygame.image.load(resource_path("SNES - Super Bomberman 2 - Miscellaneous - Bombs.png"))
     finally:
         sys.stderr.close()
         sys.stderr = old_stderr
@@ -371,7 +414,7 @@ try:
     old_stderr = sys.stderr
     sys.stderr = open(os.devnull, 'w')
     try:
-        player_sprite_sheet = pygame.image.load("SNES - Super Bomberman 2 - Playable Characters - Bomberman.png")
+        player_sprite_sheet = pygame.image.load(resource_path("SNES - Super Bomberman 2 - Playable Characters - Bomberman.png"))
     finally:
         sys.stderr.close()
         sys.stderr = old_stderr
@@ -498,40 +541,45 @@ try:
     row12_sprite5 = pygame.transform.scale(row12_sprite5, (int(PLAYER_SPRITE_WIDTH * 2.5), int(PLAYER_SPRITE_HEIGHT * 2.5)))
     death_sprites.append(row12_sprite5)
     
-    # Load glove pickup animation sprites from row 7 (facing forward/down)
-    # Row 7 (1-indexed) = y = 6 * 32 = 192
-    # Sprites: 1 = x=0, 2 = x=16, 3 = x=32
-    # Animation sequence: 2,3,2,1,2,3
-    glove_pickup_sprites = []
-    GLOVE_PICKUP_ROW_7_Y = 6 * 32  # Row 7 (1-indexed) = 192
+    # Load glove pickup animation sprites for all directions
+    # Dictionary: 'up', 'right', 'down', 'left' -> list of sprites [sprite1, sprite2, sprite3, sprite4]
+    # Sprites: 1 = x=0, 2 = x=16, 3 = x=32, 4 = x=48
+    glove_pickup_sprites = {}
     
-    # Sprite 1 (x=0)
-    glove_sprite1 = pygame.Surface((PLAYER_SPRITE_WIDTH, PLAYER_SPRITE_HEIGHT))
-    glove_sprite1.blit(player_sprite_sheet, (0, 0), (0, GLOVE_PICKUP_ROW_7_Y, PLAYER_SPRITE_WIDTH, PLAYER_SPRITE_HEIGHT))
-    glove_sprite1 = remove_chroma_key(glove_sprite1)
-    glove_sprite1 = pygame.transform.scale(glove_sprite1, (int(PLAYER_SPRITE_WIDTH * 2.5), int(PLAYER_SPRITE_HEIGHT * 2.5)))
-    glove_pickup_sprites.append(glove_sprite1)
+    # Helper function to load sprites from a row
+    def load_glove_row_sprites(row_y):
+        sprites = []
+        for sprite_num in range(1, 5):  # Sprites 1-4
+            x_offset = (sprite_num - 1) * 16  # x=0, 16, 32, 48
+            sprite = pygame.Surface((PLAYER_SPRITE_WIDTH, PLAYER_SPRITE_HEIGHT))
+            sprite.blit(player_sprite_sheet, (0, 0), (x_offset, row_y, PLAYER_SPRITE_WIDTH, PLAYER_SPRITE_HEIGHT))
+            sprite = remove_chroma_key(sprite)
+            sprite = pygame.transform.scale(sprite, (int(PLAYER_SPRITE_WIDTH * 2.5), int(PLAYER_SPRITE_HEIGHT * 2.5)))
+            sprites.append(sprite)
+        return sprites
     
-    # Sprite 2 (x=16)
-    glove_sprite2 = pygame.Surface((PLAYER_SPRITE_WIDTH, PLAYER_SPRITE_HEIGHT))
-    glove_sprite2.blit(player_sprite_sheet, (0, 0), (16, GLOVE_PICKUP_ROW_7_Y, PLAYER_SPRITE_WIDTH, PLAYER_SPRITE_HEIGHT))
-    glove_sprite2 = remove_chroma_key(glove_sprite2)
-    glove_sprite2 = pygame.transform.scale(glove_sprite2, (int(PLAYER_SPRITE_WIDTH * 2.5), int(PLAYER_SPRITE_HEIGHT * 2.5)))
-    glove_pickup_sprites.append(glove_sprite2)
+    # Row 5 (1-indexed) = y = 4 * 32 = 128 (facing up)
+    GLOVE_PICKUP_ROW_5_Y = 4 * 32
+    glove_pickup_sprites['up'] = load_glove_row_sprites(GLOVE_PICKUP_ROW_5_Y)
     
-    # Sprite 3 (x=32)
-    glove_sprite3 = pygame.Surface((PLAYER_SPRITE_WIDTH, PLAYER_SPRITE_HEIGHT))
-    glove_sprite3.blit(player_sprite_sheet, (0, 0), (32, GLOVE_PICKUP_ROW_7_Y, PLAYER_SPRITE_WIDTH, PLAYER_SPRITE_HEIGHT))
-    glove_sprite3 = remove_chroma_key(glove_sprite3)
-    glove_sprite3 = pygame.transform.scale(glove_sprite3, (int(PLAYER_SPRITE_WIDTH * 2.5), int(PLAYER_SPRITE_HEIGHT * 2.5)))
-    glove_pickup_sprites.append(glove_sprite3)
+    # Row 6 (1-indexed) = y = 5 * 32 = 160 (facing right)
+    GLOVE_PICKUP_ROW_6_Y = 5 * 32
+    glove_pickup_sprites['right'] = load_glove_row_sprites(GLOVE_PICKUP_ROW_6_Y)
+    
+    # Row 7 (1-indexed) = y = 6 * 32 = 192 (facing down)
+    GLOVE_PICKUP_ROW_7_Y = 6 * 32
+    glove_pickup_sprites['down'] = load_glove_row_sprites(GLOVE_PICKUP_ROW_7_Y)
+    
+    # Row 8 (1-indexed) = y = 7 * 32 = 224 (facing left)
+    GLOVE_PICKUP_ROW_8_Y = 7 * 32
+    glove_pickup_sprites['left'] = load_glove_row_sprites(GLOVE_PICKUP_ROW_8_Y)
     
     glove_pickup_sprites_loaded = True
     
 except Exception as e:
     player_sprite_loaded = False
     death_sprites = []
-    glove_pickup_sprites = []
+    glove_pickup_sprites = {}
     glove_pickup_sprites_loaded = False
     print(f"Warning: Could not load player sprite: {e}. Using default circle.")
 
@@ -539,9 +587,9 @@ except Exception as e:
 if 'death_sprites' not in globals():
     death_sprites = []
 
-# Initialize glove_pickup_sprites as empty list if not loaded
+# Initialize glove_pickup_sprites as empty dictionary if not loaded
 if 'glove_pickup_sprites' not in globals():
-    glove_pickup_sprites = []
+    glove_pickup_sprites = {}
     glove_pickup_sprites_loaded = False
 
 # Load pause image
@@ -552,7 +600,7 @@ try:
     old_stderr = sys.stderr
     sys.stderr = open(os.devnull, 'w')
     try:
-        pause_image = pygame.image.load("pause.png")
+        pause_image = pygame.image.load(resource_path("pause.png"))
         pause_image = pause_image.convert_alpha()  # Preserve transparency
         pause_image_loaded = True
     finally:
@@ -575,7 +623,7 @@ try:
     old_stderr = sys.stderr
     sys.stderr = open(os.devnull, 'w')
     try:
-        explosion_sheet = pygame.image.load("SNES - Super Bomberman 2 - Miscellaneous - Bombs.png")
+        explosion_sheet = pygame.image.load(resource_path("SNES - Super Bomberman 2 - Miscellaneous - Bombs.png"))
     finally:
         sys.stderr.close()
         sys.stderr = old_stderr
@@ -639,7 +687,7 @@ try:
     old_stderr = sys.stderr
     sys.stderr = open(os.devnull, 'w')
     try:
-        item_explosion_sheet = pygame.image.load("SNES - Super Bomberman 2 - Miscellaneous - Bombs.png")
+        item_explosion_sheet = pygame.image.load(resource_path("SNES - Super Bomberman 2 - Miscellaneous - Bombs.png"))
     finally:
         sys.stderr.close()
         sys.stderr = old_stderr
@@ -674,7 +722,7 @@ try:
     old_stderr = sys.stderr
     sys.stderr = open(os.devnull, 'w')
     try:
-        tileset_sheet = pygame.image.load("SNES - Super Bomberman 2 - Tilesets - Battle Game Tiles.png")
+        tileset_sheet = pygame.image.load(resource_path("SNES - Super Bomberman 2 - Tilesets - Battle Game Tiles.png"))
     finally:
         sys.stderr.close()
         sys.stderr = old_stderr
@@ -767,7 +815,7 @@ try:
     old_stderr = sys.stderr
     sys.stderr = open(os.devnull, 'w')
     try:
-        items_sheet = pygame.image.load("SNES - Super Bomberman 2 - Miscellaneous - Items.png")
+        items_sheet = pygame.image.load(resource_path("SNES - Super Bomberman 2 - Miscellaneous - Items.png"))
     finally:
         sys.stderr.close()
         sys.stderr = old_stderr
@@ -1251,10 +1299,28 @@ def draw_bombs(current_time):
     # Draw bomb sprites (only if not exploded) with pulsing animation
     # Animation sequence: first sprite -> second sprite -> third sprite -> loop between second and third
     # Skip drawing bombs that are being held by player (they're drawn over player's head)
+    # Skip drawing bombs that are being picked up (they're drawn in draw_player function)
+    # Skip drawing thrown bombs (they're drawn separately after powerups)
     for bomb in bombs:
         if not bomb.exploded:
+            # Skip drawing if bomb is being held (thrown and not moving)
+            if bomb.is_thrown and not bomb.is_moving:
+                continue
+            # Skip drawing if bomb is being picked up (drawn in draw_player function)
+            if bomb == glove_pickup_bomb:
+                continue
+            # Skip drawing thrown bombs (they're drawn separately after powerups)
+            if bomb.is_thrown:
+                continue
                 
+            # Use grid position for non-thrown bombs
             x, y = bomb.get_pixel_pos()
+            
+            # Apply bounce offset for visual bounce animation
+            bounce_offset = bomb.bounce_offset if hasattr(bomb, 'bounce_offset') else 0.0
+            draw_y = y - bounce_offset  # Subtract offset so bomb bounces upward
+            
+            # Normal drawing for non-thrown bombs
             if bomb_sprite_loaded and len(bomb_sprites) >= 3:
                 # Calculate animation frame based on time elapsed since bomb was placed
                 time_since_placed = current_time - bomb.placed_time
@@ -1266,13 +1332,167 @@ def draw_bombs(current_time):
                 frame_index = animation_pattern[frame_count % len(animation_pattern)]
                 
                 bomb_sprite = bomb_sprites[frame_index]
-                # Draw bomb sprite centered on bomb position
-                sprite_rect = bomb_sprite.get_rect(center=(int(x), int(y)))
+                # Draw bomb sprite centered on bomb position with bounce offset
+                sprite_rect = bomb_sprite.get_rect(center=(int(x), int(draw_y)))
                 window.blit(bomb_sprite, sprite_rect)
             else:
                 # Fallback to circle if sprite didn't load
-                pygame.draw.circle(window, ORANGE, (int(x), int(y)), CELL_SIZE // 3)
-                pygame.draw.circle(window, BLACK, (int(x), int(y)), CELL_SIZE // 6)
+                pygame.draw.circle(window, ORANGE, (int(x), int(draw_y)), CELL_SIZE // 3)
+                pygame.draw.circle(window, BLACK, (int(x), int(draw_y)), CELL_SIZE // 6)
+
+def draw_thrown_bombs(current_time):
+    """Draw thrown bombs (called after powerups so they appear in front)"""
+    for bomb in bombs:
+        if not bomb.exploded and bomb.is_thrown and bomb.is_moving:
+            # Skip drawing if bomb is being picked up (drawn in draw_player function)
+            if bomb == glove_pickup_bomb:
+                continue
+                
+            # Use actual pixel position for thrown bombs to show wrapping correctly
+            x = bomb.pixel_x
+            y = bomb.pixel_y
+            
+            # Apply bounce offset for visual bounce animation
+            bounce_offset = bomb.bounce_offset if hasattr(bomb, 'bounce_offset') else 0.0
+            draw_y = y - bounce_offset  # Subtract offset so bomb bounces upward
+            
+            # Draw bomb at current position and wrapped positions when offscreen (Pac-Man style)
+            draw_positions = set()  # Use set to avoid duplicates
+            bomb_radius = CELL_SIZE // 2
+            
+            # Check if bomb is wrapping on X or Y axis
+            x_wrapping = (x < 0 or x > WINDOW_WIDTH)
+            y_wrapping = (draw_y < 0 or draw_y > WINDOW_HEIGHT)
+            
+            # Check if bomb just wrapped back onscreen (for wraparound animation)
+            # Show wraparound animation as long as the flag is active, regardless of distance or bouncing
+            just_wrapped_back_draw = False
+            if hasattr(bomb, 'just_wrapped_back_offscreen') and bomb.just_wrapped_back_offscreen:
+                # Always show wraparound animation when flag is active
+                # Check distance traveled since wrapping back to determine if animation should continue
+                if hasattr(bomb, 'wrap_back_pixel_x') and bomb.wrap_back_pixel_x is not None:
+                    # Calculate actual distance traveled (accounting for wrapping)
+                    dx_wrap = x - bomb.wrap_back_pixel_x
+                    dy_wrap = draw_y - bomb.wrap_back_pixel_y
+                    # Account for wrapping in distance calculation
+                    if abs(dx_wrap) > WINDOW_WIDTH / 2:
+                        if dx_wrap > 0:
+                            dx_wrap = dx_wrap - WINDOW_WIDTH
+                        else:
+                            dx_wrap = dx_wrap + WINDOW_WIDTH
+                    if abs(dy_wrap) > WINDOW_HEIGHT / 2:
+                        if dy_wrap > 0:
+                            dy_wrap = dy_wrap - WINDOW_HEIGHT
+                        else:
+                            dy_wrap = dy_wrap + WINDOW_HEIGHT
+                    distance_from_wrap_edge = math.sqrt(dx_wrap**2 + dy_wrap**2)
+                    # Show animation until bomb has traveled at least 3 tiles from wrap edge
+                    # This ensures wraparound is visible even when target is far away or when bouncing
+                    if distance_from_wrap_edge < CELL_SIZE * 3:
+                        just_wrapped_back_draw = True
+                elif hasattr(bomb, 'wrap_back_pixel_y') and bomb.wrap_back_pixel_y is not None:
+                    # Calculate actual distance traveled (accounting for wrapping)
+                    dx_wrap = x - bomb.wrap_back_pixel_x if hasattr(bomb, 'wrap_back_pixel_x') and bomb.wrap_back_pixel_x is not None else 0
+                    dy_wrap = draw_y - bomb.wrap_back_pixel_y
+                    # Account for wrapping in distance calculation
+                    if abs(dx_wrap) > WINDOW_WIDTH / 2:
+                        if dx_wrap > 0:
+                            dx_wrap = dx_wrap - WINDOW_WIDTH
+                        else:
+                            dx_wrap = dx_wrap + WINDOW_WIDTH
+                    if abs(dy_wrap) > WINDOW_HEIGHT / 2:
+                        if dy_wrap > 0:
+                            dy_wrap = dy_wrap - WINDOW_HEIGHT
+                        else:
+                            dy_wrap = dy_wrap + WINDOW_HEIGHT
+                    distance_from_wrap_edge = math.sqrt(dx_wrap**2 + dy_wrap**2)
+                    # Show animation until bomb has traveled at least 3 tiles from wrap edge
+                    if distance_from_wrap_edge < CELL_SIZE * 3:
+                        just_wrapped_back_draw = True
+                else:
+                    # If wrap position not set, show animation anyway if flag is active
+                    just_wrapped_back_draw = True
+            
+            # Calculate wrapped positions
+            if x < 0:
+                wrapped_x = x + WINDOW_WIDTH
+            elif x > WINDOW_WIDTH:
+                wrapped_x = x - WINDOW_WIDTH
+            else:
+                wrapped_x = x
+            
+            if draw_y < 0:
+                wrapped_y = draw_y + WINDOW_HEIGHT
+            elif draw_y > WINDOW_HEIGHT:
+                wrapped_y = draw_y - WINDOW_HEIGHT
+            else:
+                wrapped_y = draw_y
+            
+            # Pac-Man style: Show bomb at both edges when wrapping
+            # Always add current position (will be clipped if offscreen)
+            draw_positions.add((x, draw_y))
+            
+            # Add wrapped positions when wrapping OR when bomb just wrapped back onscreen (for animation)
+            # This ensures wraparound animation is visible even when bomb is onscreen but recently wrapped
+            if x_wrapping or just_wrapped_back_draw:
+                # Show wrapped X position with current Y
+                # If bomb just wrapped back, calculate wrapped position based on throw direction
+                if just_wrapped_back_draw and not x_wrapping:
+                    # Bomb wrapped back and is now onscreen - show at opposite edge for wraparound effect
+                    if hasattr(bomb, 'throw_direction_x') and bomb.throw_direction_x != 0:
+                        if bomb.throw_direction_x > 0:  # Moving right, show at left edge
+                            wrapped_x_draw = x - WINDOW_WIDTH
+                        else:  # Moving left, show at right edge
+                            wrapped_x_draw = x + WINDOW_WIDTH
+                        draw_positions.add((wrapped_x_draw, draw_y))
+                else:
+                    # Normal wrapping - show wrapped position
+                    draw_positions.add((wrapped_x, draw_y))
+                
+                # If Y is also wrapping, show fully wrapped position
+                if y_wrapping:
+                    draw_positions.add((wrapped_x, wrapped_y))
+            
+            if y_wrapping or just_wrapped_back_draw:
+                # Show wrapped Y position with current X (if X wasn't already handled)
+                if not x_wrapping and not (just_wrapped_back_draw and hasattr(bomb, 'throw_direction_x') and bomb.throw_direction_x != 0):
+                    # If bomb just wrapped back vertically, calculate wrapped position
+                    if just_wrapped_back_draw and not y_wrapping:
+                        if hasattr(bomb, 'throw_direction_y') and bomb.throw_direction_y != 0:
+                            if bomb.throw_direction_y > 0:  # Moving down, show at top edge
+                                wrapped_y_draw = draw_y - WINDOW_HEIGHT
+                            else:  # Moving up, show at bottom edge
+                                wrapped_y_draw = draw_y + WINDOW_HEIGHT
+                            draw_positions.add((x, wrapped_y_draw))
+                    else:
+                        draw_positions.add((x, wrapped_y))
+                # Fully wrapped position already added above if x_wrapping is True
+            
+            # Draw at all positions (only positions that are actually visible on screen)
+            # Use larger margin to show bomb going offscreen and coming back onscreen (Pac-Man style)
+            visibility_margin = CELL_SIZE * 2  # Allow bomb to be visible even when partially offscreen
+            for draw_x, draw_y_pos in draw_positions:
+                # Only draw if position is actually on the visible screen (with margin for partial visibility)
+                if (draw_x >= -visibility_margin and draw_x <= WINDOW_WIDTH + visibility_margin and
+                    draw_y_pos >= -visibility_margin and draw_y_pos <= WINDOW_HEIGHT + visibility_margin):
+                    if bomb_sprite_loaded and len(bomb_sprites) >= 3:
+                        # Calculate animation frame based on time elapsed since bomb was placed
+                        time_since_placed = current_time - bomb.placed_time
+                        frame_count = time_since_placed // BOMB_ANIMATION_SPEED
+                        
+                        # Animation sequence: 0 -> 1 -> 2 -> 1 -> 0 -> 1 -> 2 -> 1 -> 0 -> ...
+                        # Pattern: [0, 1, 2, 1, 0] repeating
+                        animation_pattern = [0, 1, 2, 1, 0]
+                        frame_index = animation_pattern[frame_count % len(animation_pattern)]
+                        
+                        bomb_sprite = bomb_sprites[frame_index]
+                        # Draw bomb sprite centered on bomb position with bounce offset
+                        sprite_rect = bomb_sprite.get_rect(center=(int(draw_x), int(draw_y_pos)))
+                        window.blit(bomb_sprite, sprite_rect)
+                    else:
+                        # Fallback to circle if sprite didn't load
+                        pygame.draw.circle(window, ORANGE, (int(draw_x), int(draw_y_pos)), CELL_SIZE // 3)
+                        pygame.draw.circle(window, BLACK, (int(draw_x), int(draw_y_pos)), CELL_SIZE // 6)
 
 def calculate_circle_rect_overlap(circle_x, circle_y, circle_radius, rect_x, rect_y, rect_width, rect_height):
     """Calculate the overlap area between a circle and rectangle
@@ -1536,7 +1756,7 @@ def check_player_in_explosion(player_x, player_y, explosion_cells):
 
 def reset_game():
     """Reset the game state"""
-    global player_x, player_y, bombs, destructible_walls, breaking_blocks, max_bombs, powerups, item_explosions, MOVE_SPEED, BOMB_EXPLOSION_RANGE, can_kick, has_glove, thrown_bomb, is_throwing, glove_pickup_animation_start_time
+    global player_x, player_y, bombs, destructible_walls, breaking_blocks, max_bombs, powerups, item_explosions, MOVE_SPEED, BOMB_EXPLOSION_RANGE, can_kick, has_glove, thrown_bomb, is_throwing, glove_pickup_animation_start_time, glove_pickup_animation_direction, glove_pickup_bomb
     
     # Reset player position to spawn
     player_x = 1 * CELL_SIZE + CELL_SIZE // 2
@@ -1571,6 +1791,8 @@ def reset_game():
     thrown_bomb = None
     is_throwing = False
     glove_pickup_animation_start_time = None
+    glove_pickup_animation_direction = None
+    glove_pickup_bomb = None
     
     # Regenerate destructible walls with random removal
     destructible_walls = generate_destructible_walls()
@@ -1716,8 +1938,17 @@ def draw_hitboxes():
     # Draw bomb hitboxes (cell-sized rectangles)
     for bomb in bombs:
         if not bomb.exploded:
-            bomb_x = bomb.grid_x * CELL_SIZE
-            bomb_y = bomb.grid_y * CELL_SIZE
+            # For thrown/bouncing bombs, use pixel position for hitbox
+            # For stationary bombs, use grid position
+            if bomb.is_thrown and bomb.is_moving:
+                # Use pixel position for moving thrown bombs
+                bomb_radius = CELL_SIZE // 2
+                bomb_x = bomb.pixel_x - bomb_radius
+                bomb_y = bomb.pixel_y - bomb_radius
+            else:
+                # Use grid position for stationary bombs
+                bomb_x = bomb.grid_x * CELL_SIZE
+                bomb_y = bomb.grid_y * CELL_SIZE
             pygame.draw.rect(window, BLUE, (bomb_x, bomb_y, CELL_SIZE, CELL_SIZE), 2)
     
     # Draw wall hitboxes (cell-sized rectangles)
@@ -1742,7 +1973,7 @@ def draw_hitboxes():
 
 def draw_player(current_time=None):
     """Draw the player at their current position with walking animation or death animation"""
-    global player_direction, player_moving, game_over, death_time, glove_pickup_animation_start_time
+    global player_direction, player_moving, game_over, death_time, glove_pickup_animation_start_time, glove_pickup_animation_direction, glove_pickup_bomb, thrown_bomb, is_throwing
     
     # Check if we should show death animation
     if game_over and death_time is not None and current_time is not None and death_sprites:
@@ -1881,37 +2112,375 @@ def draw_player(current_time=None):
             return
     
     # Check if we should show glove pickup animation
-    # Animation plays when: player has glove, is standing on bomb, and facing down
-    if (glove_pickup_animation_start_time is not None and current_time is not None and 
-        glove_pickup_sprites_loaded and len(glove_pickup_sprites) >= 3):
-        # Animation sequence: 2,3,2,1,2,3,2 (sprite indices: 1,2,1,0,1,2,1)
-        # Each frame duration: 100ms (0.1 seconds)
-        GLOVE_PICKUP_FRAME_DURATION = 100  # milliseconds per frame
-        GLOVE_PICKUP_ANIMATION_DURATION = 7 * GLOVE_PICKUP_FRAME_DURATION  # 700ms total
+    # Animation plays when: player has glove, is standing on bomb
+    if (glove_pickup_animation_start_time is not None and glove_pickup_animation_direction is not None and 
+        current_time is not None and glove_pickup_sprites_loaded and 
+        glove_pickup_animation_direction in glove_pickup_sprites):
+        
+        # Get sprites for current direction
+        direction_sprites = glove_pickup_sprites[glove_pickup_animation_direction]
+        
+        # Define animation sequences for each direction (sprite indices: 0=sprite1, 1=sprite2, 2=sprite3, 3=sprite4)
+        sequences = {
+            'up': [2, 3, 2, 1, 0, 2, 3, 2],      # Row 5: 3,4,3,2,1,3,4,3 (8 frames)
+            'right': [2, 3, 1, 3, 2],            # Row 6: 3,4,2,4,3 (5 frames)
+            'down': [1, 2, 1, 0, 1, 2, 1],       # Row 7: 2,3,2,1,2,3,2 (7 frames)
+            'left': [2, 3, 1, 0, 1, 3, 1]       # Row 8: 3,4,2,1,2,4,2 (7 frames)
+        }
+        
+        # Define frame durations for each direction (in milliseconds)
+        # Reduced durations for faster pickup animation
+        # For 'right': frame 1 (index 1) has +200ms buffer, frame 2 (index 2) has +100ms buffer
+        frame_durations = {
+            'up': [60] * 8,  # All frames 60ms (faster)
+            'right': [60, 180, 120, 60, 60],  # Reduced proportionally: Frame 1: 180ms, Frame 2: 120ms
+            'down': [60] * 7,  # All frames 60ms (faster)
+            'left': [60] * 7   # All frames 60ms (faster)
+        }
+        
+        sequence = sequences[glove_pickup_animation_direction]
+        durations = frame_durations[glove_pickup_animation_direction]
+        GLOVE_PICKUP_ANIMATION_DURATION = sum(durations)  # Total duration
         
         elapsed = current_time - glove_pickup_animation_start_time
         
         if elapsed < GLOVE_PICKUP_ANIMATION_DURATION:
-            # Determine which frame to show based on elapsed time
-            frame_index = int(elapsed / GLOVE_PICKUP_FRAME_DURATION)
-            frame_index = min(frame_index, 6)  # Clamp to valid range (0-6)
+            # Determine which frame to show based on cumulative elapsed time
+            cumulative_time = 0
+            frame_index = 0
+            for i, duration in enumerate(durations):
+                if elapsed < cumulative_time + duration:
+                    frame_index = i
+                    break
+                cumulative_time += duration
             
-            # Animation sequence: 2,3,2,1,2,3,2 (sprite indices: 1,2,1,0,1,2,1)
-            sequence = [1, 2, 1, 0, 1, 2, 1]  # Indices into glove_pickup_sprites array
+            frame_index = min(frame_index, len(sequence) - 1)  # Clamp to valid range
+            
             sprite_index = sequence[frame_index]
+            sprite = direction_sprites[sprite_index]
             
-            sprite = glove_pickup_sprites[sprite_index]
+            # Update bomb position to follow player during animation
+            # Make bomb move upward as animation progresses to simulate picking it up
+            if glove_pickup_bomb is not None:
+                # Calculate animation progress (0.0 to 1.0)
+                animation_progress = elapsed / GLOVE_PICKUP_ANIMATION_DURATION
+                
+                # Throw bomb halfway through animation (at 0.5 progress)
+                if animation_progress >= 0.5 and not glove_pickup_bomb.is_moving:
+                    # Initialize variables
+                    target_pixel_x = None
+                    target_pixel_y = None
+                    dx_dir = 0
+                    dy_dir = 0
+                    
+                    # Check if throw target was pre-stored (when throwing bomb not on same tile)
+                    throw_start_grid_x = None
+                    throw_start_grid_y = None
+                    if hasattr(glove_pickup_bomb, '_throw_target_x') and hasattr(glove_pickup_bomb, '_throw_target_y'):
+                        # Use pre-stored throw target
+                        target_pixel_x = glove_pickup_bomb._throw_target_x
+                        target_pixel_y = glove_pickup_bomb._throw_target_y
+                        dx_dir = glove_pickup_bomb._throw_direction_x
+                        dy_dir = glove_pickup_bomb._throw_direction_y
+                        # Store initial throw start position from original position
+                        throw_start_grid_x = int(glove_pickup_bomb._original_pixel_x // CELL_SIZE)
+                        throw_start_grid_y = int(glove_pickup_bomb._original_pixel_y // CELL_SIZE)
+                        # Use pre-stored initial target if available, otherwise use final target
+                        if hasattr(glove_pickup_bomb, '_initial_target_x') and hasattr(glove_pickup_bomb, '_initial_target_y'):
+                            initial_target_x = glove_pickup_bomb._initial_target_x
+                            initial_target_y = glove_pickup_bomb._initial_target_y
+                        else:
+                            initial_target_x = target_pixel_x
+                            initial_target_y = target_pixel_y
+                    else:
+                        # Calculate throw destination - find first available tile in direction (when standing on bomb)
+                        initial_target_x = None
+                        initial_target_y = None
+                        player_grid_x = int(player_x // CELL_SIZE)
+                        player_grid_y = int(player_y // CELL_SIZE)
+                        
+                        # Determine direction vector
+                        if glove_pickup_animation_direction == 'up':
+                            dx_dir = 0
+                            dy_dir = -1
+                        elif glove_pickup_animation_direction == 'down':
+                            dx_dir = 0
+                            dy_dir = 1
+                        elif glove_pickup_animation_direction == 'left':
+                            dx_dir = -1
+                            dy_dir = 0
+                        elif glove_pickup_animation_direction == 'right':
+                            dx_dir = 1
+                            dy_dir = 0
+                        else:
+                            dx_dir = 0
+                            dy_dir = 0
+                        
+                        # Always throw to exactly 3 tiles for initial arc
+                        initial_distance = 3  # Always throw to exactly 3 tiles for initial arc
+                        initial_target_grid_x = (player_grid_x + dx_dir * initial_distance) % GRID_WIDTH
+                        initial_target_grid_y = (player_grid_y + dy_dir * initial_distance) % GRID_HEIGHT
+                        
+                        # Set initial target to exactly 3 tiles (for pronounced arc animation)
+                        initial_target_x = initial_target_grid_x * CELL_SIZE + CELL_SIZE // 2
+                        initial_target_y = initial_target_grid_y * CELL_SIZE + CELL_SIZE // 2
+                        
+                        # Find final target (first available tile starting from 3 tiles)
+                        throw_x = None
+                        throw_y = None
+                        max_search_distance = GRID_WIDTH + GRID_HEIGHT
+                        
+                        for distance in range(initial_distance, max_search_distance + 1):
+                            check_x = (player_grid_x + dx_dir * distance) % GRID_WIDTH
+                            check_y = (player_grid_y + dy_dir * distance) % GRID_HEIGHT
+                            
+                            # Check if tile has a block (wall, destructible wall, or powerup)
+                            has_block = (check_x, check_y) in walls or (check_x, check_y) in destructible_walls or (check_x, check_y) in powerups
+                            
+                            # Check if tile has another bomb
+                            has_bomb = False
+                            for other_bomb in bombs:
+                                if other_bomb.grid_x == check_x and other_bomb.grid_y == check_y and not other_bomb.exploded:
+                                    has_bomb = True
+                                    break
+                            
+                            # If tile is clear, use it as final target
+                            if not has_block and not has_bomb:
+                                throw_x = check_x
+                                throw_y = check_y
+                                break
+                        
+                        if throw_x is not None and throw_y is not None:
+                            target_pixel_x = throw_x * CELL_SIZE + CELL_SIZE // 2
+                            target_pixel_y = throw_y * CELL_SIZE + CELL_SIZE // 2
+                    
+                    # If we found a valid tile (or have pre-stored target), throw the bomb
+                    if target_pixel_x is not None and target_pixel_y is not None:
+                        # Throw the bomb (can be thrown over walls)
+                        # Store reference to bomb before clearing it
+                        thrown_bomb_ref = glove_pickup_bomb
+                        glove_pickup_bomb.is_thrown = True
+                        thrown_bomb_ref.throw_start_time = current_time
+                        thrown_bomb_ref.is_moving = True
+                        
+                        thrown_bomb_ref.throw_target_x = target_pixel_x
+                        thrown_bomb_ref.throw_target_y = target_pixel_y
+                        thrown_bomb_ref.throw_direction_x = dx_dir  # Store direction for wrapping
+                        thrown_bomb_ref.throw_direction_y = dy_dir
+                        
+                        # Store initial 3-tile target for pronounced arc animation
+                        if initial_target_x is not None and initial_target_y is not None:
+                            thrown_bomb_ref.initial_target_x = initial_target_x
+                            thrown_bomb_ref.initial_target_y = initial_target_y
+                            thrown_bomb_ref.reached_initial_target = False
+                        else:
+                            # If no initial target set, mark as reached immediately (fallback)
+                            thrown_bomb_ref.reached_initial_target = True
+                        
+                        # Store initial throw start position (grid coordinates) for tracking distance
+                        if throw_start_grid_x is not None and throw_start_grid_y is not None:
+                            # Use pre-stored start position (when throwing from distance)
+                            thrown_bomb_ref.throw_start_grid_x = throw_start_grid_x
+                            thrown_bomb_ref.throw_start_grid_y = throw_start_grid_y
+                        else:
+                            # Use current position (when standing on bomb)
+                            thrown_bomb_ref.throw_start_grid_x = int(thrown_bomb_ref.pixel_x // CELL_SIZE)
+                            thrown_bomb_ref.throw_start_grid_y = int(thrown_bomb_ref.pixel_y // CELL_SIZE)
+                        
+                        # Calculate direction - use direct path unless it's very long or target is same as start
+                        current_x = thrown_bomb_ref.pixel_x
+                        current_y = thrown_bomb_ref.pixel_y
+                        
+                        # Calculate direct path distance
+                        dx_direct = target_pixel_x - current_x
+                        dy_direct = target_pixel_y - current_y
+                        direct_distance = math.sqrt(dx_direct * dx_direct + dy_direct * dy_direct)
+                        
+                        # Check if target is same as starting position (or very close - within 1 cell)
+                        target_is_same_as_start = direct_distance < CELL_SIZE * 1.5
+                        
+                        # Check if target requires wrapping (is on opposite side of screen)
+                        # Wrap only if direct path distance is longer than screen width/height
+                        # This means target is actually on opposite side, not just far away on same side
+                        screen_center_x = WINDOW_WIDTH / 2
+                        screen_center_y = WINDOW_HEIGHT / 2
+                        
+                        # Check if target is on opposite side of screen center
+                        current_on_right = current_x > screen_center_x
+                        current_on_bottom = current_y > screen_center_y
+                        target_on_right = target_pixel_x > screen_center_x
+                        target_on_bottom = target_pixel_y > screen_center_y
+                        
+                        target_opposite_side_x = (current_on_right != target_on_right)
+                        target_opposite_side_y = (current_on_bottom != target_on_bottom)
+                        
+                        # Check if throw is going offscreen (target is on opposite side)
+                        is_thrown_offscreen = (abs(dx_direct) > WINDOW_WIDTH * 0.75 and target_opposite_side_x) or (abs(dy_direct) > WINDOW_HEIGHT * 0.75 and target_opposite_side_y)
+                        
+                        # Wrap if:
+                        # 1. Target is same as start position (force wrap), OR
+                        # 2. Throw is going offscreen (target is on opposite side)
+                        # This ensures bombs wrap when thrown offscreen but bounce when there are many blocks on same side
+                        should_wrap_x = (target_is_same_as_start and abs(dx_direct) < CELL_SIZE and thrown_bomb_ref.throw_direction_x != 0) or (is_thrown_offscreen and abs(dx_direct) > WINDOW_WIDTH * 0.75 and target_opposite_side_x)
+                        should_wrap_y = (target_is_same_as_start and abs(dy_direct) < CELL_SIZE and thrown_bomb_ref.throw_direction_y != 0) or (is_thrown_offscreen and abs(dy_direct) > WINDOW_HEIGHT * 0.75 and target_opposite_side_y)
+                        
+                        THROW_SPEED = 10.0  # Faster throw speed
+                        
+                        # If wrapping is needed (thrown offscreen), move in throw direction to go offscreen first
+                        # Otherwise, bomb should go to initial 3-tile target first (ignoring walls)
+                        if should_wrap_x or should_wrap_y:
+                            # Move in throw direction - bomb will go offscreen and wrap naturally
+                            if thrown_bomb_ref.throw_direction_x != 0:
+                                thrown_bomb_ref.velocity_x = thrown_bomb_ref.throw_direction_x * THROW_SPEED
+                                thrown_bomb_ref.velocity_y = 0.0
+                            elif thrown_bomb_ref.throw_direction_y != 0:
+                                thrown_bomb_ref.velocity_x = 0.0
+                                thrown_bomb_ref.velocity_y = thrown_bomb_ref.throw_direction_y * THROW_SPEED
+                            else:
+                                # Fallback - shouldn't happen
+                                dx = dx_direct
+                                dy = dy_direct
+                                distance = math.sqrt(dx * dx + dy * dy)
+                                if distance > 0:
+                                    thrown_bomb_ref.velocity_x = (dx / distance) * THROW_SPEED
+                                    thrown_bomb_ref.velocity_y = (dy / distance) * THROW_SPEED
+                        else:
+                            # Not thrown offscreen - bomb should ALWAYS go to initial 3-tile target first (ignoring walls)
+                            # Calculate direction to initial target (ignoring walls for first 3 tiles)
+                            if initial_target_x is not None and initial_target_y is not None:
+                                # Use initial 3-tile target - bomb will fly over walls for first 3 tiles
+                                dx_initial = initial_target_x - current_x
+                                dy_initial = initial_target_y - current_y
+                                distance_initial = math.sqrt(dx_initial * dx_initial + dy_initial * dy_initial)
+                                if distance_initial > 0:
+                                    thrown_bomb_ref.velocity_x = (dx_initial / distance_initial) * THROW_SPEED
+                                    thrown_bomb_ref.velocity_y = (dy_initial / distance_initial) * THROW_SPEED
+                            else:
+                                # Fallback to final target if no initial target (shouldn't happen normally)
+                                dx = dx_direct
+                                dy = dy_direct
+                                distance = math.sqrt(dx * dx + dy * dy)
+                                if distance > 0:
+                                    thrown_bomb_ref.velocity_x = (dx / distance) * THROW_SPEED
+                                    thrown_bomb_ref.velocity_y = (dy / distance) * THROW_SPEED
+                        
+                        # Initialize wrap tracking for same-target throws
+                        if target_is_same_as_start:
+                            thrown_bomb_ref._has_wrapped = False
+                            thrown_bomb_ref._start_pixel_x = thrown_bomb_ref.pixel_x
+                            thrown_bomb_ref._start_pixel_y = thrown_bomb_ref.pixel_y
+                        
+                        # Start pronounced bounce animation for initial throw arc
+                        thrown_bomb_ref.bounce_start_time = current_time
+                        thrown_bomb_ref.bounce_velocity = 5.0  # Lower upward velocity for initial arc (positive = upward)
+                        thrown_bomb_ref.bounce_offset = 0.0
+                        thrown_bomb_ref.bounced_walls = set()  # Initialize bounced walls tracking
+                        
+                        # Play throw sound effect
+                        if throw_sound:
+                            throw_sound.play()
+                        
+                        # Clean up stored throw target attributes
+                        if hasattr(glove_pickup_bomb, '_throw_target_x'):
+                            delattr(glove_pickup_bomb, '_throw_target_x')
+                        if hasattr(glove_pickup_bomb, '_throw_target_y'):
+                            delattr(glove_pickup_bomb, '_throw_target_y')
+                        if hasattr(glove_pickup_bomb, '_throw_direction_x'):
+                            delattr(glove_pickup_bomb, '_throw_direction_x')
+                        if hasattr(glove_pickup_bomb, '_throw_direction_y'):
+                            delattr(glove_pickup_bomb, '_throw_direction_y')
+                        if hasattr(glove_pickup_bomb, '_original_pixel_x'):
+                            delattr(glove_pickup_bomb, '_original_pixel_x')
+                        if hasattr(glove_pickup_bomb, '_original_pixel_y'):
+                            delattr(glove_pickup_bomb, '_original_pixel_y')
+                        
+                        # Clear the pickup bomb reference since it's now thrown
+                        # Animation will continue until completion
+                        glove_pickup_bomb = None
+                
+                # Before halfway point, move bomb upward to player's middle
+                if glove_pickup_bomb is not None:
+                    # Check if bomb was thrown from a different tile (has stored original position)
+                    if hasattr(glove_pickup_bomb, '_original_pixel_x'):
+                        # Bomb was thrown from in front - interpolate from original position to player
+                        original_x = glove_pickup_bomb._original_pixel_x
+                        original_y = glove_pickup_bomb._original_pixel_y
+                        target_x = player_x
+                        target_y = player_y
+                        
+                        # Faster interpolation - accelerate progress to make bomb move faster
+                        half_progress = min(animation_progress / 0.5, 1.0)  # Clamp to 1.0 at halfway
+                        # Apply speed multiplier for faster movement (1.5x speed)
+                        speed_multiplier = 1.5
+                        eased_progress = min(half_progress * speed_multiplier, 1.0)
+                        bomb_x = original_x + (target_x - original_x) * eased_progress
+                        bomb_y = original_y + (target_y - original_y) * eased_progress
+                    else:
+                        # Bomb was on same tile - move upward to player's middle
+                        base_y = player_y + PLAYER_RADIUS  # Ground level
+                        target_y = player_y  # Player's middle (center of player)
+                        
+                        # Faster interpolation - accelerate progress to make bomb move faster
+                        half_progress = min(animation_progress / 0.5, 1.0)  # Clamp to 1.0 at halfway
+                        # Apply speed multiplier for faster movement (1.5x speed)
+                        speed_multiplier = 1.5
+                        eased_progress = min(half_progress * speed_multiplier, 1.0)
+                        bomb_y = base_y + (target_y - base_y) * eased_progress
+                        bomb_x = player_x
+                    
+                    # Position bomb slightly in front of player based on direction
+                    # This makes it appear in front of the character model
+                    offset_forward = 8  # Pixels forward from center
+                    if glove_pickup_animation_direction == 'up':
+                        bomb_x = player_x
+                        bomb_y_offset = -offset_forward  # Slightly forward (up)
+                    elif glove_pickup_animation_direction == 'down':
+                        bomb_x = player_x
+                        bomb_y_offset = offset_forward  # Slightly forward (down)
+                    elif glove_pickup_animation_direction == 'left':
+                        bomb_x = player_x - offset_forward
+                        bomb_y_offset = 0
+                    elif glove_pickup_animation_direction == 'right':
+                        bomb_x = player_x + offset_forward
+                        bomb_y_offset = 0
+                    else:
+                        bomb_x = player_x
+                        bomb_y_offset = 0
+                    
+                    # Update bomb position to follow player and move upward
+                    glove_pickup_bomb.pixel_x = bomb_x
+                    glove_pickup_bomb.pixel_y = bomb_y + bomb_y_offset
+                    glove_pickup_bomb.update_grid_pos()
             
-            # Draw glove pickup animation sprite
+            # Draw glove pickup animation sprite (player sprite)
             sprite_width, sprite_height = sprite.get_size()
             offset_below = 4
             sprite_x = int(player_x - sprite_width // 2)
             sprite_y = int((player_y + PLAYER_RADIUS + offset_below) - sprite_height)
             window.blit(sprite, (sprite_x, sprite_y))
+            
+            # Draw the bomb in front of the player sprite during pickup animation
+            if glove_pickup_bomb is not None:
+                if bomb_sprite_loaded and len(bomb_sprites) >= 3:
+                    # Use first bomb sprite frame (index 0) during pickup
+                    bomb_sprite = bomb_sprites[0]
+                    sprite_rect = bomb_sprite.get_rect(center=(int(glove_pickup_bomb.pixel_x), int(glove_pickup_bomb.pixel_y)))
+                    window.blit(bomb_sprite, sprite_rect)
+                else:
+                    # Fallback to circle
+                    pygame.draw.circle(window, ORANGE, (int(glove_pickup_bomb.pixel_x), int(glove_pickup_bomb.pixel_y)), CELL_SIZE // 3)
+                    pygame.draw.circle(window, BLACK, (int(glove_pickup_bomb.pixel_x), int(glove_pickup_bomb.pixel_y)), CELL_SIZE // 6)
+            
             return
         else:
-            # Animation complete, reset
+            # Animation complete - reset animation state
+            if glove_pickup_bomb is not None:
+                # Bomb should have been thrown, but if it wasn't, clean up
+                glove_pickup_bomb = None
+            
+            # Reset animation state now that it's complete
             glove_pickup_animation_start_time = None
+            glove_pickup_animation_direction = None
     
     # Normal player drawing
     if player_sprite_loaded:
@@ -1949,7 +2518,7 @@ def restart_music():
     global music_muted
     try:
         pygame.mixer.music.stop()
-        pygame.mixer.music.load("Super Bomberman 2 - Battle 1 (SNES OST).mp3")
+        pygame.mixer.music.load(resource_path("Super Bomberman 2 - Battle 1 (SNES OST).mp3"))
         # Set volume based on mute state (music is quieter at 0.5 volume)
         if music_muted:
             pygame.mixer.music.set_volume(0.0)
@@ -1960,7 +2529,15 @@ def restart_music():
         print(f"Warning: Could not load music: {e}")
 
 def main():
-    global player_x, player_y, bombs, game_over, death_time, player_direction, player_moving, invincible, max_bombs, MOVE_SPEED, BOMB_EXPLOSION_RANGE, can_kick, show_hitboxes, music_muted, thrown_bomb, is_throwing, has_glove, glove_pickup_animation_start_time
+    global player_x, player_y, bombs, game_over, death_time, player_direction, player_moving, invincible, max_bombs, MOVE_SPEED, BOMB_EXPLOSION_RANGE, can_kick, show_hitboxes, music_muted, thrown_bomb, is_throwing, has_glove, glove_pickup_animation_start_time, glove_pickup_animation_direction, glove_pickup_bomb
+    
+    # Debug: Test console output
+    print("=" * 50)
+    print("GAME STARTED - Debug mode active")
+    print(f"Bomb bounce sound loaded: {bomb_bounce_sound is not None}")
+    if bomb_bounce_sound:
+        print(f"Bomb bounce sound length: {bomb_bounce_sound.get_length()} seconds")
+    print("=" * 50)
     
     # Load and play background music
     restart_music()
@@ -2038,6 +2615,13 @@ def main():
                     else:
                         # Unmute music (at reduced volume)
                         pygame.mixer.music.set_volume(0.5)  # Reduced from 1.0 to 0.5 (50% volume)
+                elif event.key == pygame.K_g:
+                    # Give player glove powerup (debug/cheat)
+                    if not has_glove:
+                        has_glove = True
+                        # Play item get sound effect
+                        if item_get_sound:
+                            item_get_sound.play()
                 elif event.key == pygame.K_SPACE:
                     # Only allow placing bombs when not paused and not in death animation
                     death_animation_playing = False
@@ -2061,11 +2645,14 @@ def main():
                                 player_bomb_check = bomb
                                 break
                         
-                        # If standing on bomb with glove facing down, start animation
+                        # If standing on bomb with glove, start animation for current direction
+                        # Only start if animation is not already playing
                         animation_started = False
-                        if (has_glove and player_bomb_check is not None and player_direction == 'down' and 
-                            not is_throwing):
+                        if (has_glove and player_bomb_check is not None and player_direction in ['up', 'right', 'down', 'left'] and 
+                            not is_throwing and glove_pickup_animation_start_time is None):
                             glove_pickup_animation_start_time = current_time
+                            glove_pickup_animation_direction = player_direction
+                            glove_pickup_bomb = player_bomb_check  # Store the bomb being picked up
                             animation_started = True
                         
                         # Only allow picking up/throwing if not already throwing, has glove, and animation didn't start
@@ -2089,55 +2676,76 @@ def main():
                             for bomb in bombs:
                                 if (not bomb.exploded and bomb.grid_x == front_x and bomb.grid_y == front_y and
                                     not bomb.is_thrown and not bomb.is_moving):
-                                    # Calculate throw destination (2 tiles ahead)
-                                    throw_x = player_grid_x
-                                    throw_y = player_grid_y
+                                    # Calculate throw destination - find first available tile in direction
+                                    # Determine direction vector
                                     if player_direction == 'up':
-                                        throw_y -= 2
+                                        dx_dir = 0
+                                        dy_dir = -1
                                     elif player_direction == 'down':
-                                        throw_y += 2
+                                        dx_dir = 0
+                                        dy_dir = 1
                                     elif player_direction == 'left':
-                                        throw_x -= 2
+                                        dx_dir = -1
+                                        dy_dir = 0
                                     elif player_direction == 'right':
-                                        throw_x += 2
+                                        dx_dir = 1
+                                        dy_dir = 0
+                                    else:
+                                        dx_dir = 0
+                                        dy_dir = 0
                                     
-                                    # Check if throw position is valid (not a wall and within bounds)
-                                    if (0 <= throw_x < GRID_WIDTH and 0 <= throw_y < GRID_HEIGHT and
-                                        (throw_x, throw_y) not in walls and (throw_x, throw_y) not in destructible_walls):
-                                        # Check if there's already a bomb at throw position
-                                        bomb_at_throw_pos = False
+                                    # Always throw to exactly 3 tiles for initial arc
+                                    initial_distance = 3
+                                    initial_target_grid_x = (player_grid_x + dx_dir * initial_distance) % GRID_WIDTH
+                                    initial_target_grid_y = (player_grid_y + dy_dir * initial_distance) % GRID_HEIGHT
+                                    
+                                    # Find final target (first available tile starting from 3 tiles)
+                                    throw_x = None
+                                    throw_y = None
+                                    max_search_distance = GRID_WIDTH + GRID_HEIGHT
+                                    
+                                    for distance in range(initial_distance, max_search_distance + 1):
+                                        check_x = (player_grid_x + dx_dir * distance) % GRID_WIDTH
+                                        check_y = (player_grid_y + dy_dir * distance) % GRID_HEIGHT
+                                        
+                                        # Check if tile has a block (wall or destructible wall)
+                                        has_block = (check_x, check_y) in walls or (check_x, check_y) in destructible_walls
+                                        
+                                        # Check if tile has another bomb
+                                        has_bomb = False
                                         for other_bomb in bombs:
-                                            if other_bomb.grid_x == throw_x and other_bomb.grid_y == throw_y and not other_bomb.exploded:
-                                                bomb_at_throw_pos = True
+                                            if other_bomb != bomb and other_bomb.grid_x == check_x and other_bomb.grid_y == check_y and not other_bomb.exploded:
+                                                has_bomb = True
                                                 break
                                         
-                                        if not bomb_at_throw_pos:
-                                            # Start throwing the bomb
-                                            bomb.is_thrown = True
-                                            bomb.throw_start_time = current_time
-                                            bomb.is_moving = True
-                                            thrown_bomb = bomb
-                                            is_throwing = True
-                                            
-                                            # Set velocity to move bomb to throw position
-                                            target_pixel_x = throw_x * CELL_SIZE + CELL_SIZE // 2
-                                            target_pixel_y = throw_y * CELL_SIZE + CELL_SIZE // 2
-                                            
-                                            # Calculate direction and distance
-                                            dx = target_pixel_x - bomb.pixel_x
-                                            dy = target_pixel_y - bomb.pixel_y
-                                            distance = math.sqrt(dx * dx + dy * dy)
-                                            
-                                            # Set throw speed (faster than kick speed)
-                                            THROW_SPEED = 8.0  # pixels per frame
-                                            if distance > 0:
-                                                bomb.velocity_x = (dx / distance) * THROW_SPEED
-                                                bomb.velocity_y = (dy / distance) * THROW_SPEED
-                                            
-                                            # Play place bomb sound effect
-                                            if place_bomb_sound:
-                                                place_bomb_sound.play()
+                                        # If tile is clear, use it
+                                        if not has_block and not has_bomb:
+                                            throw_x = check_x
+                                            throw_y = check_y
                                             break
+                                    
+                                    # If we found a valid tile, start the pickup animation
+                                    if throw_x is not None and throw_y is not None:
+                                        # Start the glove pickup animation
+                                        glove_pickup_animation_start_time = current_time
+                                        glove_pickup_animation_direction = player_direction
+                                        glove_pickup_bomb = bomb
+                                        is_throwing = True
+                                        thrown_bomb = bomb
+                                        
+                                        # Store throw target for later (will be set when animation throws the bomb)
+                                        bomb._throw_target_x = throw_x * CELL_SIZE + CELL_SIZE // 2
+                                        bomb._throw_target_y = throw_y * CELL_SIZE + CELL_SIZE // 2
+                                        # Store initial 3-tile target for pronounced arc
+                                        bomb._initial_target_x = initial_target_grid_x * CELL_SIZE + CELL_SIZE // 2
+                                        bomb._initial_target_y = initial_target_grid_y * CELL_SIZE + CELL_SIZE // 2
+                                        bomb._throw_direction_x = dx_dir
+                                        bomb._throw_direction_y = dy_dir
+                                        
+                                        # Store original bomb position for animation interpolation
+                                        bomb._original_pixel_x = bomb.pixel_x
+                                        bomb._original_pixel_y = bomb.pixel_y
+                                        break
                         
                         # Only allow placing new bombs if not throwing
                         if not is_throwing:
@@ -2252,10 +2860,8 @@ def main():
                     player_bomb = bomb
                     break
             
-            # Reset animation if player moves off bomb or changes direction (but keep it running if still on bomb)
-            if not (has_glove and player_bomb is not None and player_direction == 'down'):
-                # Reset animation if player moves off bomb or changes direction
-                glove_pickup_animation_start_time = None
+            # Don't reset animation if it's already playing (let it complete)
+            # Animation will complete on its own or be reset when bomb is picked up
             
             # Check if player collected a powerup
             player_pos = (player_grid_x, player_grid_y)
@@ -2300,24 +2906,30 @@ def main():
             
             # Move player with arrow keys (smooth pixel-based movement)
             # Track direction for sprite selection
+            # Prevent movement during glove pickup animation
             player_moving = False
-            if keys[pygame.K_UP]:
-                new_y = player_y - MOVE_SPEED
-                player_direction = 'up'
-                player_moving = True
-            elif keys[pygame.K_DOWN]:
-                new_y = player_y + MOVE_SPEED
-                player_direction = 'down'
-                player_moving = True
-            
-            if keys[pygame.K_LEFT]:
-                new_x = player_x - MOVE_SPEED
-                player_direction = 'left'
-                player_moving = True
-            elif keys[pygame.K_RIGHT]:
-                new_x = player_x + MOVE_SPEED
-                player_direction = 'right'
-                player_moving = True
+            if glove_pickup_animation_start_time is not None:
+                # Animation is playing, don't allow movement - skip all movement logic
+                player_moving = False
+            else:
+                # Only process movement if animation is not playing
+                if keys[pygame.K_UP]:
+                    new_y = player_y - MOVE_SPEED
+                    player_direction = 'up'
+                    player_moving = True
+                elif keys[pygame.K_DOWN]:
+                    new_y = player_y + MOVE_SPEED
+                    player_direction = 'down'
+                    player_moving = True
+                
+                if keys[pygame.K_LEFT]:
+                    new_x = player_x - MOVE_SPEED
+                    player_direction = 'left'
+                    player_moving = True
+                elif keys[pygame.K_RIGHT]:
+                    new_x = player_x + MOVE_SPEED
+                    player_direction = 'right'
+                    player_moving = True
             
             # Check for bomb kicking - when player moves into contact with a bomb, kick it away
             # If player has kick ability and is moving, check if they're touching a bomb
@@ -2509,29 +3121,31 @@ def main():
             # Check collision separately for X and Y to allow sliding along walls
             # This prevents getting stuck on corners when moving diagonally
             # Player can move through the bomb they're currently on, but not others
-            # Try X movement first
-            if not check_collision(new_x, player_y, exclude_bomb=player_bomb):
-                player_x = new_x
-            
-            # Try Y movement (using updated player_x)
-            # Update player_bomb check after X movement
-            new_player_grid_x = int(player_x // CELL_SIZE)
-            new_player_grid_y = int(player_y // CELL_SIZE)
-            new_player_bomb = None
-            for bomb in bombs:
-                if bomb.exploded:
-                    continue
-                # Check if player is on this bomb using pixel collision
-                bomb_radius = CELL_SIZE // 2
-                dx = player_x - bomb.pixel_x
-                dy = player_y - bomb.pixel_y
-                distance_squared = dx * dx + dy * dy
-                if distance_squared < (PLAYER_RADIUS + bomb_radius) * (PLAYER_RADIUS + bomb_radius):
-                    new_player_bomb = bomb
-                    break
-            
-            if not check_collision(player_x, new_y, exclude_bomb=new_player_bomb):
-                player_y = new_y
+            # Skip movement updates during glove pickup animation
+            if glove_pickup_animation_start_time is None:
+                # Try X movement first
+                if not check_collision(new_x, player_y, exclude_bomb=player_bomb):
+                    player_x = new_x
+                
+                # Try Y movement (using updated player_x)
+                # Update player_bomb check after X movement
+                new_player_grid_x = int(player_x // CELL_SIZE)
+                new_player_grid_y = int(player_y // CELL_SIZE)
+                new_player_bomb = None
+                for bomb in bombs:
+                    if bomb.exploded:
+                        continue
+                    # Check if player is on this bomb using pixel collision
+                    bomb_radius = CELL_SIZE // 2
+                    dx = player_x - bomb.pixel_x
+                    dy = player_y - bomb.pixel_y
+                    distance_squared = dx * dx + dy * dy
+                    if distance_squared < (PLAYER_RADIUS + bomb_radius) * (PLAYER_RADIUS + bomb_radius):
+                        new_player_bomb = bomb
+                        break
+                
+                if not check_collision(player_x, new_y, exclude_bomb=new_player_bomb):
+                    player_y = new_y
             
             # Check if player's hitbox has fully left any bombs they were previously on
             # This allows bombs to be kicked after the player has left them
@@ -2578,11 +3192,1251 @@ def main():
                     bomb.step_off_cooldown -= 1
             
             # Update moving bombs (smooth pixel-based movement)
+            # Update thrown bomb to follow player if being held
+            if is_throwing and thrown_bomb is not None and not thrown_bomb.is_moving:
+                # Make bomb follow player position
+                thrown_bomb.pixel_x = player_x
+                thrown_bomb.pixel_y = player_y
+                thrown_bomb.update_grid_pos()
+            
             for bomb in bombs:
                 if bomb.is_moving and not bomb.exploded:
                     # Calculate new pixel position
                     new_bomb_x = bomb.pixel_x + bomb.velocity_x
                     new_bomb_y = bomb.pixel_y + bomb.velocity_y
+                    
+                    # Apply wrapping and edge wall bouncing for thrown bombs
+                    if bomb.is_thrown:
+                        bomb_radius = CELL_SIZE // 2
+                        bomb_left = new_bomb_x - bomb_radius
+                        bomb_right = new_bomb_x + bomb_radius
+                        bomb_top = new_bomb_y - bomb_radius
+                        bomb_bottom = new_bomb_y + bomb_radius
+                        
+                        # Thrown bombs should wrap around screen edges, not bounce off edge walls
+                        # Edge wall bouncing is disabled for thrown bombs to allow wrapping
+                        
+                        # Update bounce animation for thrown bombs
+                        if bomb.bounce_start_time is not None:
+                            # Calculate bounce animation
+                            bounce_elapsed = current_time - bomb.bounce_start_time
+                            
+                            # Use more pronounced arc for initial throw (before reaching initial target)
+                            if hasattr(bomb, 'reached_initial_target') and not bomb.reached_initial_target:
+                                GRAVITY = 0.35  # Moderate gravity for lower arc
+                                BOUNCE_DAMPING = 0.2  # More damping to keep arc lower
+                                MAX_BOUNCE_TIME = 250  # Shorter bounce duration for lower arc
+                            else:
+                                GRAVITY = 0.3  # Reduced gravity for less bouncy effect
+                                BOUNCE_DAMPING = 0.2  # Increased damping for less bouncy effect (lower = more damping)
+                                MAX_BOUNCE_TIME = 200  # Reduced bounce duration (ms)
+                            
+                            if bounce_elapsed < MAX_BOUNCE_TIME:
+                                # Apply gravity (making velocity less positive, eventually negative)
+                                bomb.bounce_velocity -= GRAVITY
+                                bomb.bounce_offset += bomb.bounce_velocity
+                                
+                                # Bounce off ground (when offset reaches 0 from above)
+                                # bounce_offset starts positive (upward), gravity makes it less positive, eventually negative
+                                if bomb.bounce_offset <= 0:
+                                    bomb.bounce_offset = 0
+                                    if bomb.bounce_velocity < 0:
+                                        # Reverse and dampen the bounce
+                                        bomb.bounce_velocity = -bomb.bounce_velocity * BOUNCE_DAMPING
+                                        # Stop bounce if velocity is too small
+                                        if abs(bomb.bounce_velocity) < 0.5:
+                                            bomb.bounce_velocity = 0
+                                            bomb.bounce_offset = 0
+                                            bomb.bounce_start_time = None
+                            else:
+                                # Bounce animation complete
+                                bomb.bounce_offset = 0
+                                bomb.bounce_velocity = 0
+                                bomb.bounce_start_time = None
+                        
+                        # Don't wrap position immediately - let bomb go offscreen for visual animation
+                        # Wrapping will be handled in drawing and collision detection
+                        
+                        # If bomb has wrapped around (gone offscreen), mark as ready to bounce
+                        if (new_bomb_x < 0 or new_bomb_x > WINDOW_WIDTH or 
+                            new_bomb_y < 0 or new_bomb_y > WINDOW_HEIGHT):
+                            # Bomb has wrapped - mark that it has wrapped and allow bouncing
+                            bomb._has_wrapped = True
+                            # Also mark as reached initial target so it can bounce
+                            if not hasattr(bomb, 'reached_initial_target'):
+                                bomb.reached_initial_target = False
+                            if not bomb.reached_initial_target:
+                                bomb.reached_initial_target = True
+                    
+                    # Check if thrown bomb has reached its target destination
+                    # Use wrapped position for target detection but keep actual position for visual
+                    if bomb.is_thrown and bomb.throw_target_x is not None and bomb.throw_target_y is not None:
+                        # Track if bomb just wrapped (was offscreen, now onscreen)
+                        was_offscreen = (bomb.pixel_x < 0 or bomb.pixel_x > WINDOW_WIDTH or
+                                        bomb.pixel_y < 0 or bomb.pixel_y > WINDOW_HEIGHT)
+                        is_now_onscreen = (new_bomb_x >= 0 and new_bomb_x <= WINDOW_WIDTH and
+                                          new_bomb_y >= 0 and new_bomb_y <= WINDOW_HEIGHT)
+                        just_wrapped_back = was_offscreen and is_now_onscreen
+                        
+                        # If bomb just wrapped back, check if it was thrown offscreen
+                        if just_wrapped_back:
+                            was_thrown_offscreen_flag = False
+                            if hasattr(bomb, 'throw_start_grid_x') and hasattr(bomb, 'throw_start_grid_y'):
+                                start_x = bomb.throw_start_grid_x % GRID_WIDTH
+                                start_y = bomb.throw_start_grid_y % GRID_HEIGHT
+                                start_pixel_x = start_x * CELL_SIZE + CELL_SIZE // 2
+                                start_pixel_y = start_y * CELL_SIZE + CELL_SIZE // 2
+                                
+                                screen_center_x = WINDOW_WIDTH / 2
+                                screen_center_y = WINDOW_HEIGHT / 2
+                                start_on_right = start_pixel_x > screen_center_x
+                                start_on_bottom = start_pixel_y > screen_center_y
+                                final_target_on_right = bomb.throw_target_x > screen_center_x
+                                final_target_on_bottom = bomb.throw_target_y > screen_center_y
+                                
+                                target_opposite_x = (start_on_right != final_target_on_right)
+                                target_opposite_y = (start_on_bottom != final_target_on_bottom)
+                                
+                                dx_to_final = bomb.throw_target_x - start_pixel_x
+                                dy_to_final = bomb.throw_target_y - start_pixel_y
+                                
+                                was_thrown_offscreen_flag = ((abs(dx_to_final) > WINDOW_WIDTH * 0.75 and target_opposite_x) or 
+                                                              (abs(dy_to_final) > WINDOW_HEIGHT * 0.75 and target_opposite_y))
+                            
+                            # Set flag to maintain throw direction after wrapping back
+                            if was_thrown_offscreen_flag:
+                                bomb.just_wrapped_back_offscreen = True
+                                bomb.wrap_back_time = current_time  # Record when bomb wrapped back
+                        
+                        # Calculate wrapped position for target detection
+                        wrapped_x = new_bomb_x
+                        wrapped_y = new_bomb_y
+                        if wrapped_x < 0:
+                            wrapped_x = wrapped_x + WINDOW_WIDTH
+                        elif wrapped_x >= WINDOW_WIDTH:
+                            wrapped_x = wrapped_x - WINDOW_WIDTH
+                        if wrapped_y < 0:
+                            wrapped_y = wrapped_y + WINDOW_HEIGHT
+                        elif wrapped_y >= WINDOW_HEIGHT:
+                            wrapped_y = wrapped_y - WINDOW_HEIGHT
+                        
+                        # Check target using grid position for more reliable detection
+                        # If bomb hasn't reached initial target yet, use initial target for checking
+                        if hasattr(bomb, 'initial_target_x') and hasattr(bomb, 'initial_target_y') and hasattr(bomb, 'reached_initial_target') and not bomb.reached_initial_target:
+                            # Use initial target for grid checking
+                            check_target_x = bomb.initial_target_x
+                            check_target_y = bomb.initial_target_y
+                        else:
+                            # Use final target
+                            check_target_x = bomb.throw_target_x
+                            check_target_y = bomb.throw_target_y
+                        
+                        target_grid_x = int(check_target_x // CELL_SIZE)
+                        target_grid_y = int(check_target_y // CELL_SIZE)
+                        current_grid_x = int(wrapped_x // CELL_SIZE)
+                        current_grid_y = int(wrapped_y // CELL_SIZE)
+                        
+                        # Wrap grid coordinates
+                        target_grid_x = target_grid_x % GRID_WIDTH
+                        target_grid_y = target_grid_y % GRID_HEIGHT
+                        current_grid_x = current_grid_x % GRID_WIDTH
+                        current_grid_y = current_grid_y % GRID_HEIGHT
+                        
+                        # If bomb just wrapped back onscreen, only update target if it has reached initial target
+                        # Otherwise, let bomb continue to initial 3-tile target first
+                        if just_wrapped_back:
+                            # Check if bomb has reached initial target first
+                            has_reached_initial = (hasattr(bomb, 'reached_initial_target') and bomb.reached_initial_target)
+                            
+                            # Check if bomb was thrown offscreen - if so, always update target when wrapping back
+                            was_thrown_offscreen_wrap = False
+                            if hasattr(bomb, 'throw_start_grid_x') and hasattr(bomb, 'throw_start_grid_y'):
+                                start_x = bomb.throw_start_grid_x % GRID_WIDTH
+                                start_y = bomb.throw_start_grid_y % GRID_HEIGHT
+                                start_pixel_x = start_x * CELL_SIZE + CELL_SIZE // 2
+                                start_pixel_y = start_y * CELL_SIZE + CELL_SIZE // 2
+                                
+                                screen_center_x = WINDOW_WIDTH / 2
+                                screen_center_y = WINDOW_HEIGHT / 2
+                                start_on_right = start_pixel_x > screen_center_x
+                                start_on_bottom = start_pixel_y > screen_center_y
+                                final_target_on_right = bomb.throw_target_x > screen_center_x
+                                final_target_on_bottom = bomb.throw_target_y > screen_center_y
+                                
+                                target_opposite_x = (start_on_right != final_target_on_right)
+                                target_opposite_y = (start_on_bottom != final_target_on_bottom)
+                                
+                                dx_to_final = bomb.throw_target_x - start_pixel_x
+                                dy_to_final = bomb.throw_target_y - start_pixel_y
+                                
+                                was_thrown_offscreen_wrap = ((abs(dx_to_final) > WINDOW_WIDTH * 0.75 and target_opposite_x) or 
+                                                              (abs(dy_to_final) > WINDOW_HEIGHT * 0.75 and target_opposite_y))
+                            
+                            # Only update target if initial target has been reached OR bomb was thrown offscreen
+                            # This ensures bomb goes 3 tiles ahead first (ignoring walls) before checking for available tiles
+                            # But if thrown offscreen, always check for available tiles when wrapping back
+                            if has_reached_initial or was_thrown_offscreen_wrap:
+                                # Check tiles systematically in throw direction, starting from current position
+                                # This ensures we check tiles next to edge walls first
+                                found_available_tile = False
+                                
+                                # Check tiles in throw direction, starting from current position
+                                # Check up to 6 tiles ahead to catch fast-moving bombs
+                                for distance in range(0, 7):  # Start from 0 (current tile) to 6 tiles ahead
+                                    check_x = (current_grid_x + bomb.throw_direction_x * distance) % GRID_WIDTH
+                                    check_y = (current_grid_y + bomb.throw_direction_y * distance) % GRID_HEIGHT
+                                    
+                                    # Check if tile is edge wall (x=0, x=GRID_WIDTH-1, etc.)
+                                    # Edge walls themselves are skipped, but tiles NEXT TO them are checked
+                                    is_check_edge = (check_x == 0 or check_x == GRID_WIDTH - 1 or 
+                                                   check_y == 0 or check_y == GRID_HEIGHT - 1)
+                                    
+                                    # Skip actual edge walls (to allow wrapping), but check tiles next to them
+                                    if is_check_edge:
+                                        continue
+                                    
+                                    # Check if tile has block
+                                    check_tile_has_block = (check_x, check_y) in walls or (check_x, check_y) in destructible_walls or (check_x, check_y) in powerups
+                                    
+                                    # Check if tile has bomb
+                                    check_tile_has_bomb = False
+                                    for other_bomb in bombs:
+                                        if other_bomb != bomb and other_bomb.grid_x == check_x and other_bomb.grid_y == check_y and not other_bomb.exploded:
+                                            check_tile_has_bomb = True
+                                            break
+                                    
+                                    # If tile is available (not blocked, no bomb), update target immediately
+                                    # BUT: Only set target if it's close (within 2 tiles) when just wrapped back
+                                    # This prevents bomb from flying across screen before bouncing
+                                    if not check_tile_has_block and not check_tile_has_bomb:
+                                        # If bomb just wrapped back, only set target if it's nearby (within 2 tiles)
+                                        # This ensures bomb bounces off blocks instead of flying to distant targets
+                                        should_set_target = True
+                                        if just_wrapped_back and was_thrown_offscreen_wrap:
+                                            if distance > 2:  # Only allow targets within 2 tiles
+                                                should_set_target = False
+                                        
+                                        if should_set_target:
+                                            bomb.throw_target_x = check_x * CELL_SIZE + CELL_SIZE // 2
+                                            bomb.throw_target_y = check_y * CELL_SIZE + CELL_SIZE // 2
+                                            # Recalculate target grid for consistency
+                                            target_grid_x = check_x
+                                            target_grid_y = check_y
+                                            
+                                            # Recalculate velocity toward new target to continue movement
+                                            # When thrown offscreen, maintain throw direction to continue wrapping behavior
+                                            THROW_SPEED = 10.0
+                                            
+                                            # If thrown offscreen and just wrapped back, maintain strict direction (don't recalculate based on target position)
+                                            # This ensures bomb continues in throw direction after wrapping, not back across screen
+                                            # Use the persistent flag to maintain direction even when target is not immediately adjacent
+                                            if was_thrown_offscreen_wrap or (hasattr(bomb, 'just_wrapped_back_offscreen') and bomb.just_wrapped_back_offscreen):
+                                                # Maintain throw direction - bomb should continue moving in same direction
+                                                if bomb.throw_direction_x != 0:
+                                                    bomb.velocity_x = bomb.throw_direction_x * THROW_SPEED
+                                                    bomb.velocity_y = 0.0
+                                                elif bomb.throw_direction_y != 0:
+                                                    bomb.velocity_x = 0.0
+                                                    bomb.velocity_y = bomb.throw_direction_y * THROW_SPEED
+                                            else:
+                                                # Not thrown offscreen - calculate direction to target normally
+                                                dx_new = bomb.throw_target_x - wrapped_x
+                                                dy_new = bomb.throw_target_y - wrapped_y
+                                                
+                                                # Account for wrapping in direction calculation
+                                                if abs(dx_new) > WINDOW_WIDTH / 2:
+                                                    if dx_new > 0:
+                                                        dx_new = dx_new - WINDOW_WIDTH
+                                                    else:
+                                                        dx_new = dx_new + WINDOW_WIDTH
+                                                if abs(dy_new) > WINDOW_HEIGHT / 2:
+                                                    if dy_new > 0:
+                                                        dy_new = dy_new - WINDOW_HEIGHT
+                                                    else:
+                                                        dy_new = dy_new + WINDOW_HEIGHT
+                                                
+                                                distance_new = math.sqrt(dx_new * dx_new + dy_new * dy_new)
+                                                if distance_new > 0:
+                                                    bomb.velocity_x = (dx_new / distance_new) * THROW_SPEED
+                                                    bomb.velocity_y = (dy_new / distance_new) * THROW_SPEED
+                                            
+                                            found_available_tile = True
+                                            break  # Use first available tile found
+                                
+                                # If no available tile found in throw direction, also check adjacent tiles
+                                # This handles cases where bomb might be slightly off-center
+                                if not found_available_tile:
+                                    for adj_x in [-1, 0, 1]:
+                                        for adj_y in [-1, 0, 1]:
+                                            if adj_x == 0 and adj_y == 0:
+                                                continue  # Skip current tile (already checked)
+                                            check_x = (current_grid_x + adj_x) % GRID_WIDTH
+                                            check_y = (current_grid_y + adj_y) % GRID_HEIGHT
+                                            
+                                            # Skip edge walls
+                                            is_check_edge = (check_x == 0 or check_x == GRID_WIDTH - 1 or 
+                                                           check_y == 0 or check_y == GRID_HEIGHT - 1)
+                                            if is_check_edge:
+                                                continue
+                                            
+                                            # Check if tile is available
+                                            check_tile_has_block = (check_x, check_y) in walls or (check_x, check_y) in destructible_walls or (check_x, check_y) in powerups
+                                            check_tile_has_bomb = False
+                                            for other_bomb in bombs:
+                                                if other_bomb != bomb and other_bomb.grid_x == check_x and other_bomb.grid_y == check_y and not other_bomb.exploded:
+                                                    check_tile_has_bomb = True
+                                                    break
+                                            
+                                            if not check_tile_has_block and not check_tile_has_bomb:
+                                                bomb.throw_target_x = check_x * CELL_SIZE + CELL_SIZE // 2
+                                                bomb.throw_target_y = check_y * CELL_SIZE + CELL_SIZE // 2
+                                                target_grid_x = check_x
+                                                target_grid_y = check_y
+                                                
+                                                # Recalculate velocity toward new target to continue movement
+                                                # When thrown offscreen, maintain throw direction to continue wrapping behavior
+                                                THROW_SPEED = 10.0
+                                                
+                                                # If thrown offscreen and just wrapped back, maintain strict direction (don't recalculate based on target position)
+                                                # This ensures bomb continues in throw direction after wrapping, not back across screen
+                                                # Use the persistent flag to maintain direction even when target is not immediately adjacent
+                                                if was_thrown_offscreen_wrap or (hasattr(bomb, 'just_wrapped_back_offscreen') and bomb.just_wrapped_back_offscreen):
+                                                    # Maintain throw direction - bomb should continue moving in same direction
+                                                    if bomb.throw_direction_x != 0:
+                                                        bomb.velocity_x = bomb.throw_direction_x * THROW_SPEED
+                                                        bomb.velocity_y = 0.0
+                                                    elif bomb.throw_direction_y != 0:
+                                                        bomb.velocity_x = 0.0
+                                                        bomb.velocity_y = bomb.throw_direction_y * THROW_SPEED
+                                                else:
+                                                    # Not thrown offscreen - calculate direction to target normally
+                                                    dx_new = bomb.throw_target_x - wrapped_x
+                                                    dy_new = bomb.throw_target_y - wrapped_y
+                                                    
+                                                    # Account for wrapping in direction calculation
+                                                    if abs(dx_new) > WINDOW_WIDTH / 2:
+                                                        if dx_new > 0:
+                                                            dx_new = dx_new - WINDOW_WIDTH
+                                                        else:
+                                                            dx_new = dx_new + WINDOW_WIDTH
+                                                    if abs(dy_new) > WINDOW_HEIGHT / 2:
+                                                        if dy_new > 0:
+                                                            dy_new = dy_new - WINDOW_HEIGHT
+                                                        else:
+                                                            dy_new = dy_new + WINDOW_HEIGHT
+                                                    
+                                                    distance_new = math.sqrt(dx_new * dx_new + dy_new * dy_new)
+                                                    if distance_new > 0:
+                                                        bomb.velocity_x = (dx_new / distance_new) * THROW_SPEED
+                                                        bomb.velocity_y = (dy_new / distance_new) * THROW_SPEED
+                                                
+                                                found_available_tile = True
+                                                break
+                                        
+                                        if found_available_tile:
+                                            break
+                        
+                        # Check if bomb is currently over a block (wall or destructible wall)
+                        # Initialize bounced_walls if not exists
+                        if not hasattr(bomb, 'bounced_walls'):
+                            bomb.bounced_walls = set()
+                        
+                        # Check if bomb has reached initial target (3-tile throw)
+                        # IMPORTANT: Don't override target every frame - velocity is already set correctly when thrown
+                        # Just check if we've reached the initial target and switch to final target when reached
+                        if hasattr(bomb, 'initial_target_x') and hasattr(bomb, 'initial_target_y') and hasattr(bomb, 'reached_initial_target') and not bomb.reached_initial_target:
+                            # Check if bomb was thrown offscreen - if so, skip initial target check
+                            was_thrown_offscreen_initial = False
+                            if hasattr(bomb, 'throw_start_grid_x') and hasattr(bomb, 'throw_start_grid_y'):
+                                start_x = bomb.throw_start_grid_x % GRID_WIDTH
+                                start_y = bomb.throw_start_grid_y % GRID_HEIGHT
+                                start_pixel_x = start_x * CELL_SIZE + CELL_SIZE // 2
+                                start_pixel_y = start_y * CELL_SIZE + CELL_SIZE // 2
+                                
+                                screen_center_x = WINDOW_WIDTH / 2
+                                screen_center_y = WINDOW_HEIGHT / 2
+                                start_on_right = start_pixel_x > screen_center_x
+                                start_on_bottom = start_pixel_y > screen_center_y
+                                final_target_on_right = bomb.throw_target_x > screen_center_x
+                                final_target_on_bottom = bomb.throw_target_y > screen_center_y
+                                
+                                target_opposite_x = (start_on_right != final_target_on_right)
+                                target_opposite_y = (start_on_bottom != final_target_on_bottom)
+                                
+                                dx_to_final = bomb.throw_target_x - start_pixel_x
+                                dy_to_final = bomb.throw_target_y - start_pixel_y
+                                
+                                was_thrown_offscreen_initial = ((abs(dx_to_final) > WINDOW_WIDTH * 0.75 and target_opposite_x) or 
+                                                                 (abs(dy_to_final) > WINDOW_HEIGHT * 0.75 and target_opposite_y))
+                            
+                            # If thrown offscreen, skip initial target and go straight to final target
+                            if was_thrown_offscreen_initial:
+                                bomb.reached_initial_target = True
+                            else:
+                                # Not thrown offscreen - check if bomb has reached initial 3-tile target
+                                # Use initial target for distance check (but don't override throw_target_x/y - velocity already points there)
+                                wrapped_x_for_target = wrapped_x
+                                wrapped_y_for_target = wrapped_y
+                                
+                                # Check pixel distance to initial target
+                                dx_initial = bomb.initial_target_x - wrapped_x_for_target
+                                dy_initial = bomb.initial_target_y - wrapped_y_for_target
+                                
+                                # Account for wrapping in pixel distance
+                                if abs(dx_initial) > WINDOW_WIDTH / 2:
+                                    if dx_initial > 0:
+                                        dx_initial = dx_initial - WINDOW_WIDTH
+                                    else:
+                                        dx_initial = dx_initial + WINDOW_WIDTH
+                                if abs(dy_initial) > WINDOW_HEIGHT / 2:
+                                    if dy_initial > 0:
+                                        dy_initial = dy_initial - WINDOW_HEIGHT
+                                    else:
+                                        dy_initial = dy_initial + WINDOW_HEIGHT
+                                
+                                pixel_distance_initial = math.sqrt(dx_initial * dx_initial + dy_initial * dy_initial)
+                                
+                                # Mark as reached if very close to initial target
+                                if pixel_distance_initial < 15.0:
+                                    bomb.reached_initial_target = True
+                                    # Now switch to final target and recalculate velocity
+                                    # Find final target (first available tile starting from 3 tiles)
+                                    if hasattr(bomb, 'throw_start_grid_x') and hasattr(bomb, 'throw_start_grid_y'):
+                                        start_x = bomb.throw_start_grid_x % GRID_WIDTH
+                                        start_y = bomb.throw_start_grid_y % GRID_HEIGHT
+                                        
+                                        # Find first available tile starting from 3 tiles
+                                        for distance in range(3, GRID_WIDTH + GRID_HEIGHT + 1):
+                                            check_x = (start_x + bomb.throw_direction_x * distance) % GRID_WIDTH
+                                            check_y = (start_y + bomb.throw_direction_y * distance) % GRID_HEIGHT
+                                            
+                                            is_edge = (check_x == 0 or check_x == GRID_WIDTH - 1 or 
+                                                      check_y == 0 or check_y == GRID_HEIGHT - 1)
+                                            
+                                            has_block = False
+                                            if not is_edge:
+                                                has_block = (check_x, check_y) in walls or (check_x, check_y) in destructible_walls or (check_x, check_y) in powerups
+                                            
+                                            has_bomb = False
+                                            for other_bomb in bombs:
+                                                if other_bomb != bomb and other_bomb.grid_x == check_x and other_bomb.grid_y == check_y and not other_bomb.exploded:
+                                                    has_bomb = True
+                                                    break
+                                            
+                                            if not has_block and not has_bomb:
+                                                bomb.throw_target_x = check_x * CELL_SIZE + CELL_SIZE // 2
+                                                bomb.throw_target_y = check_y * CELL_SIZE + CELL_SIZE // 2
+                                                target_grid_x = check_x
+                                                target_grid_y = check_y
+                                                
+                                                # Recalculate velocity toward final target
+                                                THROW_SPEED = 10.0
+                                                dx_final = bomb.throw_target_x - wrapped_x_for_target
+                                                dy_final = bomb.throw_target_y - wrapped_y_for_target
+                                                
+                                                # Account for wrapping
+                                                if abs(dx_final) > WINDOW_WIDTH / 2:
+                                                    if dx_final > 0:
+                                                        dx_final = dx_final - WINDOW_WIDTH
+                                                    else:
+                                                        dx_final = dx_final + WINDOW_WIDTH
+                                                if abs(dy_final) > WINDOW_HEIGHT / 2:
+                                                    if dy_final > 0:
+                                                        dy_final = dy_final - WINDOW_HEIGHT
+                                                    else:
+                                                        dy_final = dy_final + WINDOW_HEIGHT
+                                                
+                                                distance_final = math.sqrt(dx_final * dx_final + dy_final * dy_final)
+                                                if distance_final > 0:
+                                                    bomb.velocity_x = (dx_final / distance_final) * THROW_SPEED
+                                                    bomb.velocity_y = (dy_final / distance_final) * THROW_SPEED
+                                                break
+                        
+                        # Check if current position is an edge wall (screen boundary)
+                        is_edge_wall = (current_grid_x == 0 or current_grid_x == GRID_WIDTH - 1 or 
+                                       current_grid_y == 0 or current_grid_y == GRID_HEIGHT - 1)
+                        
+                        # Check for blocks at current position (skip edge walls to allow wrapping)
+                        # Use actual bomb position to check which grid cells it overlaps
+                        bomb_radius = CELL_SIZE // 2
+                        bomb_left = wrapped_x - bomb_radius
+                        bomb_right = wrapped_x + bomb_radius
+                        bomb_top = wrapped_y - bomb_radius
+                        bomb_bottom = wrapped_y + bomb_radius
+                        
+                        # Check all grid cells the bomb overlaps
+                        # Expand range slightly to catch fast-moving bombs near tile boundaries
+                        grid_left = max(0, int(bomb_left // CELL_SIZE) - 1)
+                        grid_right = min(GRID_WIDTH - 1, int(bomb_right // CELL_SIZE) + 1)
+                        grid_top = max(0, int(bomb_top // CELL_SIZE) - 1)
+                        grid_bottom = min(GRID_HEIGHT - 1, int(bomb_bottom // CELL_SIZE) + 1)
+                        
+                        current_has_block = False
+                        current_wall_pos = None
+                        
+                        # Check if bomb has reached initial target OR if bomb has wrapped around
+                        # Check if bomb is currently offscreen
+                        is_currently_offscreen = (new_bomb_x < 0 or new_bomb_x > WINDOW_WIDTH or 
+                                                 new_bomb_y < 0 or new_bomb_y > WINDOW_HEIGHT)
+                        
+                        # Mark that bomb has wrapped if it goes offscreen
+                        if is_currently_offscreen:
+                            bomb._has_wrapped = True
+                        
+                        # Check if bomb was thrown offscreen (target is on opposite side)
+                        was_thrown_offscreen = False
+                        if hasattr(bomb, 'throw_start_grid_x') and hasattr(bomb, 'throw_start_grid_y'):
+                            start_x = bomb.throw_start_grid_x % GRID_WIDTH
+                            start_y = bomb.throw_start_grid_y % GRID_HEIGHT
+                            start_pixel_x = start_x * CELL_SIZE + CELL_SIZE // 2
+                            start_pixel_y = start_y * CELL_SIZE + CELL_SIZE // 2
+                            
+                            # Check if target is on opposite side from start
+                            screen_center_x = WINDOW_WIDTH / 2
+                            screen_center_y = WINDOW_HEIGHT / 2
+                            start_on_right = start_pixel_x > screen_center_x
+                            start_on_bottom = start_pixel_y > screen_center_y
+                            target_on_right = bomb.throw_target_x > screen_center_x
+                            target_on_bottom = bomb.throw_target_y > screen_center_y
+                            
+                            target_opposite_x = (start_on_right != target_on_right)
+                            target_opposite_y = (start_on_bottom != target_on_bottom)
+                            
+                            dx_to_target = bomb.throw_target_x - start_pixel_x
+                            dy_to_target = bomb.throw_target_y - start_pixel_y
+                            
+                            was_thrown_offscreen = ((abs(dx_to_target) > WINDOW_WIDTH * 0.75 and target_opposite_x) or 
+                                                   (abs(dy_to_target) > WINDOW_HEIGHT * 0.75 and target_opposite_y))
+                        
+                        # Bomb can bounce if:
+                        # 1. It has reached initial target (3 tiles), OR
+                        # 2. It was thrown offscreen (skip 3-tile check), OR
+                        # 3. It has wrapped at least once
+                        # IMPORTANT: If bomb just wrapped back onscreen, allow bouncing immediately
+                        # This ensures bomb bounces off blocks instead of flying across screen
+                        has_wrapped_before = (hasattr(bomb, '_has_wrapped') and bomb._has_wrapped)
+                        can_bounce = (hasattr(bomb, 'reached_initial_target') and bomb.reached_initial_target) or was_thrown_offscreen or has_wrapped_before or just_wrapped_back
+                        
+                        if can_bounce:
+                            # Check all overlapping grid cells for blocks
+                            # Also check adjacent cells to catch fast-moving bombs
+                            extended_grid_left = max(0, grid_left - 1)
+                            extended_grid_right = min(GRID_WIDTH - 1, grid_right + 1)
+                            extended_grid_top = max(0, grid_top - 1)
+                            extended_grid_bottom = min(GRID_HEIGHT - 1, grid_bottom + 1)
+                            
+                            for check_grid_x in range(extended_grid_left, extended_grid_right + 1):
+                                for check_grid_y in range(extended_grid_top, extended_grid_bottom + 1):
+                                    # Skip actual edge walls (x=0, x=GRID_WIDTH-1, etc.) to allow wrapping
+                                    # But check tiles NEXT TO edge walls (x=1, x=GRID_WIDTH-2, etc.)
+                                    is_check_edge = (check_grid_x == 0 or check_grid_x == GRID_WIDTH - 1 or 
+                                                   check_grid_y == 0 or check_grid_y == GRID_HEIGHT - 1)
+                                    
+                                    # Check blocks in all tiles except actual edge walls
+                                    # Tiles adjacent to edge walls (like x=1 when edge is x=0) should be checked
+                                    if not is_check_edge:
+                                        check_pos = (check_grid_x, check_grid_y)
+                                        if (check_pos in walls or check_pos in destructible_walls):
+                                            # Check if bomb circle actually overlaps with this cell
+                                            cell_left = check_grid_x * CELL_SIZE
+                                            cell_right = cell_left + CELL_SIZE
+                                            cell_top = check_grid_y * CELL_SIZE
+                                            cell_bottom = cell_top + CELL_SIZE
+                                            
+                                            # Find closest point on cell to bomb center
+                                            closest_x = max(cell_left, min(wrapped_x, cell_right))
+                                            closest_y = max(cell_top, min(wrapped_y, cell_bottom))
+                                            
+                                            dx = wrapped_x - closest_x
+                                            dy = wrapped_y - closest_y
+                                            distance_sq = dx * dx + dy * dy
+                                            
+                                            if distance_sq < bomb_radius * bomb_radius:
+                                                current_has_block = True
+                                                current_wall_pos = check_pos
+                                                break
+                                
+                                if current_has_block:
+                                    break
+                        
+                        # If bomb enters a wall cell it hasn't bounced off yet, bounce off it
+                        # Skip edge walls to allow wrapping
+                        # BUT: If bomb just wrapped back onscreen after being thrown offscreen, delay bounce detection
+                        # Let it continue in throw direction first to show wraparound animation
+                        should_skip_bounce = False
+                        
+                        # Check if bomb just wrapped back (this frame) or recently wrapped back
+                        if just_wrapped_back or (hasattr(bomb, 'just_wrapped_back_offscreen') and bomb.just_wrapped_back_offscreen):
+                            # Check if bomb was thrown offscreen
+                            was_thrown_offscreen_bounce = False
+                            if hasattr(bomb, 'throw_start_grid_x') and hasattr(bomb, 'throw_start_grid_y'):
+                                start_x = bomb.throw_start_grid_x % GRID_WIDTH
+                                start_y = bomb.throw_start_grid_y % GRID_HEIGHT
+                                start_pixel_x = start_x * CELL_SIZE + CELL_SIZE // 2
+                                start_pixel_y = start_y * CELL_SIZE + CELL_SIZE // 2
+                                
+                                screen_center_x = WINDOW_WIDTH / 2
+                                screen_center_y = WINDOW_HEIGHT / 2
+                                start_on_right = start_pixel_x > screen_center_x
+                                start_on_bottom = start_pixel_y > screen_center_y
+                                final_target_on_right = bomb.throw_target_x > screen_center_x
+                                final_target_on_bottom = bomb.throw_target_y > screen_center_y
+                                
+                                target_opposite_x = (start_on_right != final_target_on_right)
+                                target_opposite_y = (start_on_bottom != final_target_on_bottom)
+                                
+                                dx_to_final = bomb.throw_target_x - start_pixel_x
+                                dy_to_final = bomb.throw_target_y - start_pixel_y
+                                
+                                was_thrown_offscreen_bounce = ((abs(dx_to_final) > WINDOW_WIDTH * 0.75 and target_opposite_x) or 
+                                                               (abs(dy_to_final) > WINDOW_HEIGHT * 0.75 and target_opposite_y))
+                            
+                            # Allow bouncing immediately, but maintain throw speed and wraparound animation
+                            # The wraparound animation will be shown via drawing logic, not by delaying bounce
+                            # This ensures bomb bounces correctly while still showing animation
+                            # Don't skip bounce - let it bounce, but maintain throw speed during wraparound period
+                            should_skip_bounce = False
+                        
+                        if current_has_block and current_wall_pos is not None and current_wall_pos not in bomb.bounced_walls and not should_skip_bounce:
+                            # Mark this wall as bounced
+                            bomb.bounced_walls.add(current_wall_pos)
+                            
+                            # Start bounce animation
+                            bomb.bounce_start_time = current_time
+                            bomb.bounce_velocity = 5.0  # Small upward velocity for subtle bounce (positive = upward)
+                            bomb.bounce_offset = 0.0
+                            
+                            # Find next available tile in the same direction from the wall we hit
+                            wall_grid_x, wall_grid_y = current_wall_pos
+                            next_x = None
+                            next_y = None
+                            max_search = GRID_WIDTH * GRID_HEIGHT * 2
+                            
+                            # Start from the tile immediately after the wall (distance=1)
+                            # This ensures we check tiles next to edge walls
+                            for distance in range(1, max_search + 1):
+                                check_x = (wall_grid_x + bomb.throw_direction_x * distance) % GRID_WIDTH
+                                check_y = (wall_grid_y + bomb.throw_direction_y * distance) % GRID_HEIGHT
+                                
+                                # Check if current position is an edge wall (screen boundary) - allow wrapping through edge walls
+                                # Edge walls themselves (x=0, x=GRID_WIDTH-1) are skipped, but tiles next to them are checked
+                                is_edge_wall = (check_x == 0 or check_x == GRID_WIDTH - 1 or 
+                                               check_y == 0 or check_y == GRID_HEIGHT - 1)
+                                
+                                # Check if tile has a block (exclude actual edge walls to allow wrapping)
+                                # But tiles NEXT TO edge walls (like x=1 when edge is x=0) should be checked
+                                tile_has_block = False
+                                if not is_edge_wall:
+                                    tile_has_block = (check_x, check_y) in walls or (check_x, check_y) in destructible_walls or (check_x, check_y) in powerups
+                                
+                                # Check if tile has another bomb
+                                tile_has_bomb = False
+                                for other_bomb in bombs:
+                                    if other_bomb != bomb and other_bomb.grid_x == check_x and other_bomb.grid_y == check_y and not other_bomb.exploded:
+                                        tile_has_bomb = True
+                                        break
+                                
+                                # If tile is clear, use it as new target
+                                # This includes tiles next to edge walls (like x=1, y=1, etc.)
+                                if not tile_has_block and not tile_has_bomb:
+                                    next_x = check_x
+                                    next_y = check_y
+                                    break
+                            
+                            # If we found a next tile, update target and velocity
+                            if next_x is not None and next_y is not None:
+                                bomb.throw_target_x = next_x * CELL_SIZE + CELL_SIZE // 2
+                                bomb.throw_target_y = next_y * CELL_SIZE + CELL_SIZE // 2
+                                
+                                # Maintain strict direction - only move in original throw direction
+                                # This ensures bomb stays on the same row (horizontal) or column (vertical)
+                                # If bomb just wrapped back onscreen, maintain THROW_SPEED for wraparound animation
+                                # Otherwise use BOUNCE_SPEED for normal bouncing
+                                if hasattr(bomb, 'just_wrapped_back_offscreen') and bomb.just_wrapped_back_offscreen:
+                                    # During wraparound animation period, maintain throw speed
+                                    THROW_SPEED_BOUNCE = 10.0
+                                    if bomb.throw_direction_x != 0:
+                                        # Horizontal throw - only move horizontally
+                                        bomb.velocity_x = bomb.throw_direction_x * THROW_SPEED_BOUNCE
+                                        bomb.velocity_y = 0.0
+                                    elif bomb.throw_direction_y != 0:
+                                        # Vertical throw - only move vertically
+                                        bomb.velocity_x = 0.0
+                                        bomb.velocity_y = bomb.throw_direction_y * THROW_SPEED_BOUNCE
+                                    else:
+                                        # Fallback: calculate direction but ensure it's axis-aligned
+                                        bounce_dx = bomb.throw_target_x - new_bomb_x
+                                        bounce_dy = bomb.throw_target_y - new_bomb_y
+                                        
+                                        # Account for wrapping in direction calculation
+                                        if abs(bounce_dx) > WINDOW_WIDTH / 2:
+                                            if bounce_dx > 0:
+                                                bounce_dx = bounce_dx - WINDOW_WIDTH
+                                            else:
+                                                bounce_dx = bounce_dx + WINDOW_WIDTH
+                                        if abs(bounce_dy) > WINDOW_HEIGHT / 2:
+                                            if bounce_dy > 0:
+                                                bounce_dy = bounce_dy - WINDOW_HEIGHT
+                                            else:
+                                                bounce_dy = bounce_dy + WINDOW_HEIGHT
+                                        
+                                        # Determine which axis has larger movement and use that direction only
+                                        THROW_SPEED_BOUNCE = 10.0
+                                        if abs(bounce_dx) > abs(bounce_dy):
+                                            # Horizontal movement
+                                            bomb.velocity_x = (1 if bounce_dx > 0 else -1) * THROW_SPEED_BOUNCE
+                                            bomb.velocity_y = 0.0
+                                        else:
+                                            # Vertical movement
+                                            bomb.velocity_x = 0.0
+                                            bomb.velocity_y = (1 if bounce_dy > 0 else -1) * THROW_SPEED_BOUNCE
+                                else:
+                                    # Normal bounce - use slower speed
+                                    BOUNCE_SPEED = 4.0
+                                    if bomb.throw_direction_x != 0:
+                                        # Horizontal throw - only move horizontally
+                                        bomb.velocity_x = bomb.throw_direction_x * BOUNCE_SPEED
+                                        bomb.velocity_y = 0.0
+                                    elif bomb.throw_direction_y != 0:
+                                        # Vertical throw - only move vertically
+                                        bomb.velocity_x = 0.0
+                                        bomb.velocity_y = bomb.throw_direction_y * BOUNCE_SPEED
+                                    else:
+                                        # Fallback: calculate direction but ensure it's axis-aligned
+                                        bounce_dx = bomb.throw_target_x - new_bomb_x
+                                        bounce_dy = bomb.throw_target_y - new_bomb_y
+                                        
+                                        # Account for wrapping in direction calculation
+                                        if abs(bounce_dx) > WINDOW_WIDTH / 2:
+                                            if bounce_dx > 0:
+                                                bounce_dx = bounce_dx - WINDOW_WIDTH
+                                            else:
+                                                bounce_dx = bounce_dx + WINDOW_WIDTH
+                                        if abs(bounce_dy) > WINDOW_HEIGHT / 2:
+                                            if bounce_dy > 0:
+                                                bounce_dy = bounce_dy - WINDOW_HEIGHT
+                                            else:
+                                                bounce_dy = bounce_dy + WINDOW_HEIGHT
+                                        
+                                        # Determine which axis has larger movement and use that direction only
+                                        BOUNCE_SPEED = 4.0
+                                        if abs(bounce_dx) > abs(bounce_dy):
+                                            # Horizontal movement
+                                            bomb.velocity_x = (1 if bounce_dx > 0 else -1) * BOUNCE_SPEED
+                                            bomb.velocity_y = 0.0
+                                        else:
+                                            # Vertical movement
+                                            bomb.velocity_x = 0.0
+                                            bomb.velocity_y = (1 if bounce_dy > 0 else -1) * BOUNCE_SPEED
+                                
+                                # Play bounce sound effect
+                                if bomb_bounce_sound:
+                                    try:
+                                        bomb_bounce_sound.play()
+                                    except Exception as e:
+                                        pass  # Ignore sound errors
+                        
+                        # Check if bomb is currently over a block (for bounce sound)
+                        # Only play sound if bomb has traveled 3+ tiles from throw start
+                        if current_has_block and bomb_bounce_sound:
+                            # Calculate distance traveled in tiles
+                            tiles_traveled = 0
+                            if hasattr(bomb, 'throw_start_grid_x') and hasattr(bomb, 'throw_start_grid_y'):
+                                start_x = bomb.throw_start_grid_x % GRID_WIDTH
+                                start_y = bomb.throw_start_grid_y % GRID_HEIGHT
+                                # Calculate Manhattan distance (tiles traveled)
+                                dx_tiles = abs((current_grid_x - start_x + GRID_WIDTH // 2) % GRID_WIDTH - GRID_WIDTH // 2)
+                                dy_tiles = abs((current_grid_y - start_y + GRID_HEIGHT // 2) % GRID_HEIGHT - GRID_HEIGHT // 2)
+                                tiles_traveled = dx_tiles + dy_tiles
+                            
+                            # Only play sound if bomb has traveled 3+ tiles
+                            if tiles_traveled >= 3:
+                                # Check if we haven't already played sound for this block
+                                if not hasattr(bomb, '_last_bounce_block') or bomb._last_bounce_block != (current_grid_x, current_grid_y):
+                                    bomb._last_bounce_block = (current_grid_x, current_grid_y)
+                                    try:
+                                        bomb_bounce_sound.play()
+                                    except Exception as e:
+                                        pass  # Ignore sound errors
+                        
+                        # Check if we're at the target grid cell
+                        at_target_grid = (current_grid_x == target_grid_x and current_grid_y == target_grid_y)
+                        
+                        # Also check pixel distance for fine-tuning (within same cell)
+                        # Use initial target if bomb hasn't reached it yet, otherwise use final target
+                        if hasattr(bomb, 'initial_target_x') and hasattr(bomb, 'initial_target_y') and hasattr(bomb, 'reached_initial_target') and not bomb.reached_initial_target:
+                            check_target_pixel_x = bomb.initial_target_x
+                            check_target_pixel_y = bomb.initial_target_y
+                        else:
+                            check_target_pixel_x = bomb.throw_target_x
+                            check_target_pixel_y = bomb.throw_target_y
+                        
+                        # Use wrapped positions for distance calculation
+                        dx = check_target_pixel_x - wrapped_x
+                        dy = check_target_pixel_y - wrapped_y
+                        
+                        # Account for wrapping in pixel distance
+                        if abs(dx) > WINDOW_WIDTH / 2:
+                            if dx > 0:
+                                dx = dx - WINDOW_WIDTH
+                            else:
+                                dx = dx + WINDOW_WIDTH
+                        if abs(dy) > WINDOW_HEIGHT / 2:
+                            if dy > 0:
+                                dy = dy - WINDOW_HEIGHT
+                            else:
+                                dy = dy + WINDOW_HEIGHT
+                        
+                        pixel_distance = math.sqrt(dx * dx + dy * dy)
+                        
+                        # Check if target tile is available BEFORE checking if we've reached it
+                        # Use the actual target grid position
+                        target_grid_x = int(bomb.throw_target_x // CELL_SIZE) % GRID_WIDTH
+                        target_grid_y = int(bomb.throw_target_y // CELL_SIZE) % GRID_HEIGHT
+                        
+                        # Continuously check for available tiles in throw direction
+                        # BUT only after bomb has reached initial 3-tile target (unless thrown offscreen)
+                        # This prevents skipping tiles, especially after wrapping or near edge walls
+                        # Check if bomb has reached initial target first
+                        has_reached_initial = (hasattr(bomb, 'reached_initial_target') and bomb.reached_initial_target)
+                        was_thrown_offscreen_check = False
+                        if hasattr(bomb, 'throw_start_grid_x') and hasattr(bomb, 'throw_start_grid_x'):
+                            start_x = bomb.throw_start_grid_x % GRID_WIDTH
+                            start_y = bomb.throw_start_grid_y % GRID_HEIGHT
+                            start_pixel_x = start_x * CELL_SIZE + CELL_SIZE // 2
+                            start_pixel_y = start_y * CELL_SIZE + CELL_SIZE // 2
+                            
+                            screen_center_x = WINDOW_WIDTH / 2
+                            screen_center_y = WINDOW_HEIGHT / 2
+                            start_on_right = start_pixel_x > screen_center_x
+                            start_on_bottom = start_pixel_y > screen_center_y
+                            target_on_right = bomb.throw_target_x > screen_center_x
+                            target_on_bottom = bomb.throw_target_y > screen_center_y
+                            
+                            target_opposite_x = (start_on_right != target_on_right)
+                            target_opposite_y = (start_on_bottom != target_on_bottom)
+                            
+                            dx_to_target = bomb.throw_target_x - start_pixel_x
+                            dy_to_target = bomb.throw_target_y - start_pixel_y
+                            
+                            was_thrown_offscreen_check = ((abs(dx_to_target) > WINDOW_WIDTH * 0.75 and target_opposite_x) or 
+                                                          (abs(dy_to_target) > WINDOW_HEIGHT * 0.75 and target_opposite_y))
+                        
+                        # Only check for closer tiles if bomb has reached initial target OR was thrown offscreen
+                        if (has_reached_initial or was_thrown_offscreen_check) and (bomb.throw_direction_x != 0 or bomb.throw_direction_y != 0):
+                            # Check up to 5 tiles ahead in throw direction
+                            # This catches fast-moving bombs and ensures we check tiles next to edge walls
+                            for check_dist in range(0, 6):  # Check current tile (0) through 5 tiles ahead
+                                check_x = (current_grid_x + bomb.throw_direction_x * check_dist) % GRID_WIDTH
+                                check_y = (current_grid_y + bomb.throw_direction_y * check_dist) % GRID_HEIGHT
+                                
+                                # Skip actual edge walls (to allow wrapping)
+                                is_check_edge = (check_x == 0 or check_x == GRID_WIDTH - 1 or 
+                                               check_y == 0 or check_y == GRID_HEIGHT - 1)
+                                if is_check_edge:
+                                    continue
+                                
+                                # Check if this tile is available
+                                check_tile_has_block = (check_x, check_y) in walls or (check_x, check_y) in destructible_walls or (check_x, check_y) in powerups
+                                check_tile_has_bomb = False
+                                for other_bomb in bombs:
+                                    if other_bomb != bomb and other_bomb.grid_x == check_x and other_bomb.grid_y == check_y and not other_bomb.exploded:
+                                        check_tile_has_bomb = True
+                                        break
+                                
+                                # If we find an available tile, check if it's closer than current target
+                                if not check_tile_has_block and not check_tile_has_bomb:
+                                    # Calculate distance to current target
+                                    if bomb.throw_direction_x != 0:
+                                        dist_to_current_target = abs((target_grid_x - current_grid_x + GRID_WIDTH // 2) % GRID_WIDTH - GRID_WIDTH // 2)
+                                    else:
+                                        dist_to_current_target = abs((target_grid_y - current_grid_y + GRID_HEIGHT // 2) % GRID_HEIGHT - GRID_HEIGHT // 2)
+                                    
+                                    # If this tile is closer than current target, update target
+                                    if check_dist < dist_to_current_target:
+                                        bomb.throw_target_x = check_x * CELL_SIZE + CELL_SIZE // 2
+                                        bomb.throw_target_y = check_y * CELL_SIZE + CELL_SIZE // 2
+                                        target_grid_x = check_x
+                                        target_grid_y = check_y
+                                        
+                                        # If bomb just wrapped back after being thrown offscreen, maintain throw direction
+                                        # This ensures smooth wraparound animation even when target is not immediately adjacent
+                                        if hasattr(bomb, 'just_wrapped_back_offscreen') and bomb.just_wrapped_back_offscreen:
+                                            THROW_SPEED = 10.0
+                                            if bomb.throw_direction_x != 0:
+                                                bomb.velocity_x = bomb.throw_direction_x * THROW_SPEED
+                                                bomb.velocity_y = 0.0
+                                            elif bomb.throw_direction_y != 0:
+                                                bomb.velocity_x = 0.0
+                                                bomb.velocity_y = bomb.throw_direction_y * THROW_SPEED
+                                        
+                                        break  # Use first available tile found
+                        
+                        # Check if current position is an edge wall (screen boundary)
+                        is_target_edge_wall = (target_grid_x == 0 or target_grid_x == GRID_WIDTH - 1 or 
+                                               target_grid_y == 0 or target_grid_y == GRID_HEIGHT - 1)
+                        
+                        # Check if target tile has a block (exclude edge walls to allow wrapping)
+                        target_has_block = False
+                        if not is_target_edge_wall:
+                            target_has_block = (target_grid_x, target_grid_y) in walls or (target_grid_x, target_grid_y) in destructible_walls or (target_grid_x, target_grid_y) in powerups
+                        
+                        # Check if tile has another bomb
+                        target_has_bomb = False
+                        for other_bomb in bombs:
+                            if other_bomb != bomb and other_bomb.grid_x == target_grid_x and other_bomb.grid_y == target_grid_y and not other_bomb.exploded:
+                                target_has_bomb = True
+                                break
+                        
+                        # If target is blocked, find next available tile and update target
+                        if target_has_block or target_has_bomb:
+                            # Initialize bounced_walls if not exists
+                            if not hasattr(bomb, 'bounced_walls'):
+                                bomb.bounced_walls = set()
+                            
+                            # Mark target wall as bounced if we're close to it
+                            if at_target_grid and pixel_distance < CELL_SIZE:
+                                bomb.bounced_walls.add((target_grid_x, target_grid_y))
+                                
+                                # Start bounce animation
+                                bomb.bounce_start_time = current_time
+                                bomb.bounce_velocity = 5.0
+                                bomb.bounce_offset = 0.0
+                            
+                            # Find next available tile in same direction
+                            next_x = None
+                            next_y = None
+                            max_search = GRID_WIDTH * GRID_HEIGHT * 2
+                            
+                            for distance in range(1, max_search + 1):
+                                check_x = (target_grid_x + bomb.throw_direction_x * distance) % GRID_WIDTH
+                                check_y = (target_grid_y + bomb.throw_direction_y * distance) % GRID_HEIGHT
+                                
+                                # Check if current position is an edge wall (screen boundary) - allow wrapping through edge walls
+                                is_edge_wall = (check_x == 0 or check_x == GRID_WIDTH - 1 or 
+                                               check_y == 0 or check_y == GRID_HEIGHT - 1)
+                                
+                                # Check if tile has a block (exclude edge walls to allow wrapping)
+                                tile_has_block = False
+                                if not is_edge_wall:
+                                    tile_has_block = (check_x, check_y) in walls or (check_x, check_y) in destructible_walls or (check_x, check_y) in powerups
+                                
+                                # Check if tile has another bomb
+                                tile_has_bomb = False
+                                for other_bomb in bombs:
+                                    if other_bomb != bomb and other_bomb.grid_x == check_x and other_bomb.grid_y == check_y and not other_bomb.exploded:
+                                        tile_has_bomb = True
+                                        break
+                                
+                                # If tile is clear, use it as new target
+                                if not tile_has_block and not tile_has_bomb:
+                                    next_x = check_x
+                                    next_y = check_y
+                                    break
+                            
+                            # If we found a next tile, update target and velocity
+                            if next_x is not None and next_y is not None:
+                                bomb.throw_target_x = next_x * CELL_SIZE + CELL_SIZE // 2
+                                bomb.throw_target_y = next_y * CELL_SIZE + CELL_SIZE // 2
+                                
+                                # Maintain strict direction - only move in original throw direction
+                                # This ensures bomb stays on the same row (horizontal) or column (vertical)
+                                THROW_SPEED = 10.0
+                                if bomb.throw_direction_x != 0:
+                                    # Horizontal throw - only move horizontally
+                                    bomb.velocity_x = bomb.throw_direction_x * THROW_SPEED
+                                    bomb.velocity_y = 0.0
+                                elif bomb.throw_direction_y != 0:
+                                    # Vertical throw - only move vertically
+                                    bomb.velocity_x = 0.0
+                                    bomb.velocity_y = bomb.throw_direction_y * THROW_SPEED
+                                else:
+                                    # Fallback: calculate direction but ensure it's axis-aligned
+                                    new_dx = bomb.throw_target_x - new_bomb_x
+                                    new_dy = bomb.throw_target_y - new_bomb_y
+                                    
+                                    # Account for wrapping in direction calculation
+                                    if abs(new_dx) > WINDOW_WIDTH / 2:
+                                        if new_dx > 0:
+                                            new_dx = new_dx - WINDOW_WIDTH
+                                        else:
+                                            new_dx = new_dx + WINDOW_WIDTH
+                                    if abs(new_dy) > WINDOW_HEIGHT / 2:
+                                        if new_dy > 0:
+                                            new_dy = new_dy - WINDOW_HEIGHT
+                                        else:
+                                            new_dy = new_dy + WINDOW_HEIGHT
+                                    
+                                    # Determine which axis has larger movement and use that direction only
+                                    if abs(new_dx) > abs(new_dy):
+                                        # Horizontal movement
+                                        bomb.velocity_x = (1 if new_dx > 0 else -1) * THROW_SPEED
+                                        bomb.velocity_y = 0.0
+                                    else:
+                                        # Vertical movement
+                                        bomb.velocity_x = 0.0
+                                        bomb.velocity_y = (1 if new_dy > 0 else -1) * THROW_SPEED
+                                
+                                # Play bounce sound effect
+                                if bomb_bounce_sound:
+                                    try:
+                                        bomb_bounce_sound.play()
+                                    except Exception as e:
+                                        pass  # Ignore sound errors
+                                
+                                continue  # Continue moving to next tile
+                        
+                        # Check if target is same as start position (requires wrapping animation)
+                        target_same_as_start = False
+                        start_x = None
+                        start_y = None
+                        start_pixel_x = None
+                        start_pixel_y = None
+                        if hasattr(bomb, 'throw_start_grid_x') and hasattr(bomb, 'throw_start_grid_y'):
+                            start_x = bomb.throw_start_grid_x % GRID_WIDTH
+                            start_y = bomb.throw_start_grid_y % GRID_HEIGHT
+                            target_same_as_start = (target_grid_x == start_x and target_grid_y == start_y)
+                            
+                            # Get starting pixel position
+                            if hasattr(bomb, '_start_pixel_x'):
+                                start_pixel_x = bomb._start_pixel_x
+                                start_pixel_y = bomb._start_pixel_y
+                            else:
+                                # Store starting pixel position
+                                start_pixel_x = bomb.pixel_x
+                                start_pixel_y = bomb.pixel_y
+                                bomb._start_pixel_x = start_pixel_x
+                                bomb._start_pixel_y = start_pixel_y
+                        
+                        # If target is same as start, require bomb to wrap around at least once
+                        # Check if bomb has actually wrapped (gone offscreen and come back)
+                        has_wrapped = False
+                        has_moved_away = False
+                        if target_same_as_start and start_pixel_x is not None and start_pixel_y is not None:
+                            # Check if bomb has moved away from start position (at least 2 cells in pixels)
+                            pixel_distance_from_start = math.sqrt((new_bomb_x - start_pixel_x)**2 + (new_bomb_y - start_pixel_y)**2)
+                            has_moved_away = pixel_distance_from_start > CELL_SIZE * 2
+                            
+                            # Check if bomb has gone offscreen (wrapped) at least once
+                            # Mark that bomb has wrapped if it's currently offscreen
+                            if new_bomb_x < 0 or new_bomb_x > WINDOW_WIDTH or new_bomb_y < 0 or new_bomb_y > WINDOW_HEIGHT:
+                                bomb._has_wrapped = True
+                            
+                            # Bomb has wrapped if it's been offscreen
+                            has_wrapped = (hasattr(bomb, '_has_wrapped') and bomb._has_wrapped)
+                        
+                        # Check if bomb has reached initial 3-tile target
+                        # Bomb should NOT stop at final target until it reaches initial target first (unless thrown offscreen)
+                        has_reached_initial_target = (hasattr(bomb, 'reached_initial_target') and bomb.reached_initial_target)
+                        
+                        # Clear the just_wrapped_back_offscreen flag when bomb reaches its target
+                        # OR when bomb has traveled far enough to show wraparound animation (at least 3 tiles)
+                        # Only clear if target is actually available (not blocked)
+                        should_clear_flag = False
+                        
+                        # Check if bomb has traveled far enough from wrap-back position
+                        if hasattr(bomb, 'wrap_back_pixel_x') and bomb.wrap_back_pixel_x is not None:
+                            distance_since_wrap = math.sqrt((wrapped_x - bomb.wrap_back_pixel_x)**2 + (wrapped_y - bomb.wrap_back_pixel_y)**2)
+                            # Clear flag if bomb has traveled at least 3 tiles (enough for animation)
+                            if distance_since_wrap >= CELL_SIZE * 3:
+                                should_clear_flag = True
+                        
+                        # Also clear if bomb reaches its target
+                        if at_target_grid and pixel_distance < 10.0:
+                            # Check if target is available
+                            is_target_edge_wall_check = (target_grid_x == 0 or target_grid_x == GRID_WIDTH - 1 or 
+                                                         target_grid_y == 0 or target_grid_y == GRID_HEIGHT - 1)
+                            target_has_block_check = False
+                            if not is_target_edge_wall_check:
+                                target_has_block_check = (target_grid_x, target_grid_y) in walls or (target_grid_x, target_grid_y) in destructible_walls or (target_grid_x, target_grid_y) in powerups
+                            
+                            target_has_bomb_check = False
+                            for other_bomb in bombs:
+                                if other_bomb != bomb and other_bomb.grid_x == target_grid_x and other_bomb.grid_y == target_grid_y and not other_bomb.exploded:
+                                    target_has_bomb_check = True
+                                    break
+                            
+                            # Only clear flag if target is actually available (bomb can stop here)
+                            if not target_has_block_check and not target_has_bomb_check:
+                                should_clear_flag = True
+                        
+                        if should_clear_flag:
+                            if hasattr(bomb, 'just_wrapped_back_offscreen'):
+                                bomb.just_wrapped_back_offscreen = False
+                        
+                        # Reached target if we're at the grid cell AND very close in pixels (< 10 pixels) AND target is available
+                        # AND bomb has reached initial target (unless thrown offscreen)
+                        # IMPORTANT: If target is same as start, don't stop until bomb has moved away and wrapped
+                        
+                        # Check if bomb was thrown offscreen
+                        was_thrown_offscreen_stop = False
+                        if hasattr(bomb, 'throw_start_grid_x') and hasattr(bomb, 'throw_start_grid_y'):
+                            start_x = bomb.throw_start_grid_x % GRID_WIDTH
+                            start_y = bomb.throw_start_grid_y % GRID_HEIGHT
+                            start_pixel_x = start_x * CELL_SIZE + CELL_SIZE // 2
+                            start_pixel_y = start_y * CELL_SIZE + CELL_SIZE // 2
+                            
+                            screen_center_x = WINDOW_WIDTH / 2
+                            screen_center_y = WINDOW_HEIGHT / 2
+                            start_on_right = start_pixel_x > screen_center_x
+                            start_on_bottom = start_pixel_y > screen_center_y
+                            target_on_right = bomb.throw_target_x > screen_center_x
+                            target_on_bottom = bomb.throw_target_y > screen_center_y
+                            
+                            target_opposite_x = (start_on_right != target_on_right)
+                            target_opposite_y = (start_on_bottom != target_on_bottom)
+                            
+                            dx_to_target = bomb.throw_target_x - start_pixel_x
+                            dy_to_target = bomb.throw_target_y - start_pixel_y
+                            
+                            was_thrown_offscreen_stop = ((abs(dx_to_target) > WINDOW_WIDTH * 0.75 and target_opposite_x) or 
+                                                         (abs(dy_to_target) > WINDOW_HEIGHT * 0.75 and target_opposite_y))
+                        
+                        # If target is same as start, prevent stopping until bomb has wrapped
+                        if target_same_as_start:
+                            # Don't allow stopping until bomb has wrapped around
+                            if not has_wrapped:
+                                # Bomb hasn't wrapped yet - force it to keep moving
+                                can_stop = False
+                            else:
+                                # Bomb has wrapped - now check if it can stop
+                                # Require bomb to have moved away from start (at least 2 cells) AND wrapped around AND come back
+                                can_stop = (not target_has_block and not target_has_bomb and has_moved_away)
+                                
+                                # Additional check: bomb must be back on screen (not offscreen)
+                                if new_bomb_x < 0 or new_bomb_x > WINDOW_WIDTH or new_bomb_y < 0 or new_bomb_y > WINDOW_HEIGHT:
+                                    can_stop = False
+                        else:
+                            # Normal target - can stop if available AND bomb has reached initial target (unless thrown offscreen)
+                            can_stop = (not target_has_block and not target_has_bomb)
+                            
+                            # Don't stop until initial target is reached (unless thrown offscreen)
+                            if not was_thrown_offscreen_stop and not has_reached_initial_target:
+                                can_stop = False
+                            
+                            # If bomb just wrapped back onscreen after being thrown offscreen, ensure it continues moving
+                            # Don't stop until it has traveled far enough to show wraparound animation
+                            if hasattr(bomb, 'just_wrapped_back_offscreen') and bomb.just_wrapped_back_offscreen:
+                                if hasattr(bomb, 'wrap_back_pixel_x') and bomb.wrap_back_pixel_x is not None:
+                                    distance_since_wrap = math.sqrt((wrapped_x - bomb.wrap_back_pixel_x)**2 + (wrapped_y - bomb.wrap_back_pixel_y)**2)
+                                    # Don't stop until bomb has traveled at least 3 tiles since wrapping back
+                                    # This ensures wraparound animation is visible even when target is far away
+                                    if distance_since_wrap < CELL_SIZE * 3:
+                                        can_stop = False
+                                else:
+                                    # If wrap position not set, prevent stopping for a bit to show animation
+                                    can_stop = False
+                        
+                        if at_target_grid and pixel_distance < 10.0 and can_stop:
+                            # Check if this is the initial target
+                            if hasattr(bomb, 'initial_target_x') and hasattr(bomb, 'initial_target_y') and hasattr(bomb, 'reached_initial_target'):
+                                initial_target_grid_x = int(bomb.initial_target_x // CELL_SIZE) % GRID_WIDTH
+                                initial_target_grid_y = int(bomb.initial_target_y // CELL_SIZE) % GRID_HEIGHT
+                                if current_grid_x == initial_target_grid_x and current_grid_y == initial_target_grid_y:
+                                    bomb.reached_initial_target = True
+                            # Snap to target position (accounting for wrapping)
+                            # Find the wrapped version of target that's closest to current position
+                            target_x = bomb.throw_target_x
+                            target_y = bomb.throw_target_y
+                            
+                            # Check all possible wrapped positions of target
+                            target_options = [
+                                (target_x, target_y),  # Direct
+                                (target_x - WINDOW_WIDTH, target_y),  # Wrapped left
+                                (target_x + WINDOW_WIDTH, target_y),  # Wrapped right
+                                (target_x, target_y - WINDOW_HEIGHT),  # Wrapped up
+                                (target_x, target_y + WINDOW_HEIGHT),  # Wrapped down
+                                (target_x - WINDOW_WIDTH, target_y - WINDOW_HEIGHT),  # Wrapped diagonal
+                                (target_x - WINDOW_WIDTH, target_y + WINDOW_HEIGHT),
+                                (target_x + WINDOW_WIDTH, target_y - WINDOW_HEIGHT),
+                                (target_x + WINDOW_WIDTH, target_y + WINDOW_HEIGHT),
+                            ]
+                            
+                            # Find closest wrapped target to current position
+                            closest_target = target_options[0]
+                            min_dist = math.sqrt((target_x - new_bomb_x)**2 + (target_y - new_bomb_y)**2)
+                            for tx, ty in target_options:
+                                dist = math.sqrt((tx - new_bomb_x)**2 + (ty - new_bomb_y)**2)
+                                if dist < min_dist:
+                                    min_dist = dist
+                                    closest_target = (tx, ty)
+                            
+                            # Wrap the closest target back to screen bounds
+                            final_x = closest_target[0]
+                            final_y = closest_target[1]
+                            if final_x < 0:
+                                final_x = final_x + WINDOW_WIDTH
+                            elif final_x >= WINDOW_WIDTH:
+                                final_x = final_x - WINDOW_WIDTH
+                            if final_y < 0:
+                                final_y = final_y + WINDOW_HEIGHT
+                            elif final_y >= WINDOW_HEIGHT:
+                                final_y = final_y - WINDOW_HEIGHT
+                            
+                            # Keep actual position unwrapped for visual animation
+                            bomb.pixel_x = new_bomb_x  # Keep unwrapped for visual
+                            bomb.pixel_y = new_bomb_y  # Keep unwrapped for visual
+                            # Update grid position using wrapped coordinates for collision detection
+                            bomb.grid_x = int(final_x // CELL_SIZE)
+                            bomb.grid_y = int(final_y // CELL_SIZE)
+                            # Store wrapped position for later use when landing
+                            bomb._wrapped_x = final_x
+                            bomb._wrapped_y = final_y
+                            
+                            # Target is clear, stop the bomb
+                            # Snap bomb to grid center using wrapped coordinates
+                            # Use stored wrapped position if available, otherwise calculate it
+                            if hasattr(bomb, '_wrapped_x'):
+                                snap_x = bomb._wrapped_x
+                                snap_y = bomb._wrapped_y
+                            else:
+                                # Calculate wrapped position
+                                snap_x = new_bomb_x
+                                snap_y = new_bomb_y
+                                # Wrap X position
+                                while snap_x < 0:
+                                    snap_x = snap_x + WINDOW_WIDTH
+                                while snap_x >= WINDOW_WIDTH:
+                                    snap_x = snap_x - WINDOW_WIDTH
+                                # Wrap Y position
+                                while snap_y < 0:
+                                    snap_y = snap_y + WINDOW_HEIGHT
+                                while snap_y >= WINDOW_HEIGHT:
+                                    snap_y = snap_y - WINDOW_HEIGHT
+                            
+                            # Snap to grid center - ensure pixel position matches grid center exactly
+                            bomb.grid_x = int(snap_x // CELL_SIZE)
+                            bomb.grid_y = int(snap_y // CELL_SIZE)
+                            # Ensure grid coordinates are within bounds
+                            bomb.grid_x = bomb.grid_x % GRID_WIDTH
+                            bomb.grid_y = bomb.grid_y % GRID_HEIGHT
+                            # Set pixel position to exact grid center
+                            bomb.pixel_x = bomb.grid_x * CELL_SIZE + CELL_SIZE // 2
+                            bomb.pixel_y = bomb.grid_y * CELL_SIZE + CELL_SIZE // 2
+                            # Reset bounce offset to ensure sprite aligns
+                            bomb.bounce_offset = 0.0
+                            bomb.bounce_velocity = 0.0
+                            bomb.bounce_start_time = None
+                            
+                            # Clean up stored wrapped position
+                            if hasattr(bomb, '_wrapped_x'):
+                                delattr(bomb, '_wrapped_x')
+                                delattr(bomb, '_wrapped_y')
+                            
+                            bomb.velocity_x = 0.0
+                            bomb.velocity_y = 0.0
+                            bomb.is_moving = False
+                            # Restart timer
+                            bomb.is_thrown = False
+                            bomb.placed_time = current_time
+                            bomb.throw_target_x = None
+                            bomb.throw_target_y = None
+                            bomb.throw_direction_x = 0
+                            bomb.throw_direction_y = 0
+                            if bomb == thrown_bomb:
+                                thrown_bomb = None
+                                is_throwing = False
+                            continue  # Skip rest of movement logic
                     
                     # Check collision at new position
                     can_move_x = True
@@ -2595,11 +4449,13 @@ def main():
                     bomb_top = new_bomb_y - bomb_radius
                     bomb_bottom = new_bomb_y + bomb_radius
                     
-                    # Check bounds
-                    if bomb_left < 0 or bomb_right >= WINDOW_WIDTH:
-                        can_move_x = False
-                    if bomb_top < 0 or bomb_bottom >= WINDOW_HEIGHT:
-                        can_move_y = False
+                    # Bounds check for kicked bombs (wrapping already applied for thrown bombs above)
+                    if not bomb.is_thrown:
+                        # Normal bounds check for kicked bombs
+                        if bomb_left < 0 or bomb_right >= WINDOW_WIDTH:
+                            can_move_x = False
+                        if bomb_top < 0 or bomb_bottom >= WINDOW_HEIGHT:
+                            can_move_y = False
                     
                     # Check collision with walls (permanent and destructible)
                     grid_left = int(bomb_left // CELL_SIZE)
@@ -2607,97 +4463,121 @@ def main():
                     grid_top = int(bomb_top // CELL_SIZE)
                     grid_bottom = int(bomb_bottom // CELL_SIZE)
                     
-                    for grid_x in range(grid_left, grid_right + 1):
-                        for grid_y in range(grid_top, grid_bottom + 1):
-                            if (grid_x, grid_y) in walls or (grid_x, grid_y) in destructible_walls:
-                                # Check if bomb circle overlaps with wall cell
-                                wall_left = grid_x * CELL_SIZE
-                                wall_right = wall_left + CELL_SIZE
-                                wall_top = grid_y * CELL_SIZE
-                                wall_bottom = wall_top + CELL_SIZE
-                                
-                                # Find closest point on wall rectangle to bomb center
-                                closest_x = max(wall_left, min(new_bomb_x, wall_right))
-                                closest_y = max(wall_top, min(new_bomb_y, wall_bottom))
-                                
-                                dx = new_bomb_x - closest_x
-                                dy = new_bomb_y - closest_y
-                                distance_squared = dx * dx + dy * dy
-                                
-                                if distance_squared < bomb_radius * bomb_radius:
-                                    # Collision detected - stop movement in that direction
-                                    if abs(bomb.velocity_x) > 0:
-                                        can_move_x = False
-                                    if abs(bomb.velocity_y) > 0:
-                                        can_move_y = False
+                    # Thrown bombs can pass over walls, kicked bombs cannot
+                    if not bomb.is_thrown:
+                        for grid_x in range(grid_left, grid_right + 1):
+                            for grid_y in range(grid_top, grid_bottom + 1):
+                                if (grid_x, grid_y) in walls or (grid_x, grid_y) in destructible_walls:
+                                    # Check if bomb circle overlaps with wall cell
+                                    wall_left = grid_x * CELL_SIZE
+                                    wall_right = wall_left + CELL_SIZE
+                                    wall_top = grid_y * CELL_SIZE
+                                    wall_bottom = wall_top + CELL_SIZE
+                                    
+                                    # Find closest point on wall rectangle to bomb center
+                                    closest_x = max(wall_left, min(new_bomb_x, wall_right))
+                                    closest_y = max(wall_top, min(new_bomb_y, wall_bottom))
+                                    
+                                    dx = new_bomb_x - closest_x
+                                    dy = new_bomb_y - closest_y
+                                    distance_squared = dx * dx + dy * dy
+                                    
+                                    if distance_squared < bomb_radius * bomb_radius:
+                                        # Collision detected - stop movement in that direction
+                                        if abs(bomb.velocity_x) > 0:
+                                            can_move_x = False
+                                        if abs(bomb.velocity_y) > 0:
+                                            can_move_y = False
                     
                     # Check collision with powerups - remove them but don't stop bomb
+                    # Only remove powerups when bomb is on-screen (not when wrapping or offscreen)
+                    # Use actual bomb position (not bounce offset) for collision detection
                     powerups_to_remove = []
-                    for grid_x in range(grid_left, grid_right + 1):
-                        for grid_y in range(grid_top, grid_bottom + 1):
-                            if (grid_x, grid_y) in powerups:
-                                wall_left = grid_x * CELL_SIZE
-                                wall_right = wall_left + CELL_SIZE
-                                wall_top = grid_y * CELL_SIZE
-                                wall_bottom = wall_top + CELL_SIZE
+                    
+                    # Check if bomb is actually onscreen (not offscreen)
+                    # For thrown bombs, only check collision if bomb is onscreen (not wrapped)
+                    is_onscreen = (new_bomb_x >= 0 and new_bomb_x < WINDOW_WIDTH and 
+                                  new_bomb_y >= 0 and new_bomb_y < WINDOW_HEIGHT)
+                    
+                    # Skip powerup removal for thrown bombs (they bounce over powerups instead)
+                    if not bomb.is_thrown:
+                        # For non-thrown bombs, check collision with powerups
+                        if is_onscreen:
+                            # Use actual bomb position for collision (not wrapped position)
+                            actual_bomb_x = new_bomb_x
+                            actual_bomb_y = new_bomb_y
+                            
+                            # Calculate grid cell the bomb is in
+                            bomb_grid_x = int(actual_bomb_x // CELL_SIZE)
+                            bomb_grid_y = int(actual_bomb_y // CELL_SIZE)
+                            
+                            # Only check the single grid cell the bomb is in (not a range)
+                            # This prevents removing powerups from adjacent cells
+                            if (bomb_grid_x >= 0 and bomb_grid_x < GRID_WIDTH and 
+                                bomb_grid_y >= 0 and bomb_grid_y < GRID_HEIGHT):
                                 
-                                closest_x = max(wall_left, min(new_bomb_x, wall_right))
-                                closest_y = max(wall_top, min(new_bomb_y, wall_bottom))
-                                
-                                dx = new_bomb_x - closest_x
-                                dy = new_bomb_y - closest_y
-                                distance_squared = dx * dx + dy * dy
-                                
-                                if distance_squared < bomb_radius * bomb_radius:
-                                    # Remove powerup without animation
-                                    powerups_to_remove.append((grid_x, grid_y))
+                                if (bomb_grid_x, bomb_grid_y) in powerups:
+                                    # Check if bomb is actually colliding with powerup in this cell
+                                    powerup_x = bomb_grid_x * CELL_SIZE + CELL_SIZE // 2
+                                    powerup_y = bomb_grid_y * CELL_SIZE + CELL_SIZE // 2
+                                    
+                                    dx = actual_bomb_x - powerup_x
+                                    dy = actual_bomb_y - powerup_y
+                                    distance_squared = dx * dx + dy * dy
+                                    
+                                    if distance_squared < bomb_radius * bomb_radius:
+                                        # Remove powerup without animation
+                                        powerups_to_remove.append((bomb_grid_x, bomb_grid_y))
                     
                     # Remove powerups that were hit by the bomb
                     for powerup_pos in powerups_to_remove:
                         powerups.pop(powerup_pos, None)
                     
-                    # Check collision with other bombs
-                    for other_bomb in bombs:
-                        if other_bomb == bomb or other_bomb.exploded:
-                            continue
+                    # Check collision with other bombs (thrown bombs with target can pass through other bombs until they reach target)
+                    if not (bomb.is_thrown and bomb.throw_target_x is not None):
+                        # Only check bomb collisions for non-thrown bombs or thrown bombs without a target
+                        for other_bomb in bombs:
+                            if other_bomb == bomb or other_bomb.exploded:
+                                continue
+                            
+                            other_left = other_bomb.pixel_x - bomb_radius
+                            other_right = other_bomb.pixel_x + bomb_radius
+                            other_top = other_bomb.pixel_y - bomb_radius
+                            other_bottom = other_bomb.pixel_y + bomb_radius
+                            
+                            # Check if bounding boxes overlap
+                            if not (bomb_right < other_left or bomb_left > other_right or 
+                                    bomb_bottom < other_top or bomb_top > other_bottom):
+                                # Check actual circle collision
+                                dx = new_bomb_x - other_bomb.pixel_x
+                                dy = new_bomb_y - other_bomb.pixel_y
+                                distance_squared = dx * dx + dy * dy
+                                
+                                if distance_squared < (bomb_radius * 2) * (bomb_radius * 2):
+                                    if abs(bomb.velocity_x) > 0:
+                                        can_move_x = False
+                                    if abs(bomb.velocity_y) > 0:
+                                        can_move_y = False
+                    
+                    # Check collision with player (thrown bombs with target skip player collision to allow them to travel to target)
+                    if not (bomb.is_thrown and bomb.throw_target_x is not None):
+                        player_grid_x = int(player_x // CELL_SIZE)
+                        player_grid_y = int(player_y // CELL_SIZE)
+                        bomb_grid_x = int(bomb.pixel_x // CELL_SIZE)
+                        bomb_grid_y = int(bomb.pixel_y // CELL_SIZE)
+                        player_on_bomb = (player_grid_x == bomb_grid_x and player_grid_y == bomb_grid_y)
                         
-                        other_left = other_bomb.pixel_x - bomb_radius
-                        other_right = other_bomb.pixel_x + bomb_radius
-                        other_top = other_bomb.pixel_y - bomb_radius
-                        other_bottom = other_bomb.pixel_y + bomb_radius
-                        
-                        # Check if bounding boxes overlap
-                        if not (bomb_right < other_left or bomb_left > other_right or 
-                                bomb_bottom < other_top or bomb_top > other_bottom):
-                            # Check actual circle collision
-                            dx = new_bomb_x - other_bomb.pixel_x
-                            dy = new_bomb_y - other_bomb.pixel_y
+                        if not player_on_bomb:
+                            # Check circle collision with player
+                            dx = new_bomb_x - player_x
+                            dy = new_bomb_y - player_y
                             distance_squared = dx * dx + dy * dy
                             
-                            if distance_squared < (bomb_radius * 2) * (bomb_radius * 2):
+                            if distance_squared < (bomb_radius + PLAYER_RADIUS) * (bomb_radius + PLAYER_RADIUS):
                                 if abs(bomb.velocity_x) > 0:
                                     can_move_x = False
                                 if abs(bomb.velocity_y) > 0:
                                     can_move_y = False
-                    
-                    # Check collision with player (only if player is not on the bomb)
-                    player_grid_x = int(player_x // CELL_SIZE)
-                    player_grid_y = int(player_y // CELL_SIZE)
-                    bomb_grid_x = int(bomb.pixel_x // CELL_SIZE)
-                    bomb_grid_y = int(bomb.pixel_y // CELL_SIZE)
-                    player_on_bomb = (player_grid_x == bomb_grid_x and player_grid_y == bomb_grid_y)
-                    
-                    if not player_on_bomb:
-                        # Check circle collision with player
-                        dx = new_bomb_x - player_x
-                        dy = new_bomb_y - player_y
-                        distance_squared = dx * dx + dy * dy
-                        
-                        if distance_squared < (bomb_radius + PLAYER_RADIUS) * (bomb_radius + PLAYER_RADIUS):
-                            if abs(bomb.velocity_x) > 0:
-                                can_move_x = False
-                            if abs(bomb.velocity_y) > 0:
-                                can_move_y = False
                     
                     # Check if bomb can actually move (at least one direction)
                     can_move = can_move_x or can_move_y
@@ -2728,20 +4608,33 @@ def main():
                         bomb.velocity_y = 0.0
                     
                     # Update grid position based on pixel position
-                    bomb.update_grid_pos()
+                    # Skip grid position update for thrown bombs while moving - let them move freely
+                    if not (bomb.is_thrown and bomb.is_moving):
+                        bomb.update_grid_pos()
                     
                     # Stop bomb if both velocities are zero
                     if bomb.velocity_x == 0.0 and bomb.velocity_y == 0.0:
                         bomb.is_moving = False
-                        # Snap to center of grid cell when stopped
+                        # Snap to center of grid cell when stopped - ensure alignment
+                        # Wrap grid coordinates if needed
+                        bomb.grid_x = bomb.grid_x % GRID_WIDTH
+                        bomb.grid_y = bomb.grid_y % GRID_HEIGHT
+                        # Set pixel position to exact grid center
                         bomb.pixel_x = bomb.grid_x * CELL_SIZE + CELL_SIZE // 2
                         bomb.pixel_y = bomb.grid_y * CELL_SIZE + CELL_SIZE // 2
+                        # Reset bounce offset to ensure sprite aligns
+                        if hasattr(bomb, 'bounce_offset'):
+                            bomb.bounce_offset = 0.0
+                            bomb.bounce_velocity = 0.0
+                            bomb.bounce_start_time = None
                         
                         # If this was a thrown bomb, restart its timer
                         if bomb.is_thrown:
                             bomb.is_thrown = False
                             # Restart timer completely by resetting placed_time to current time
                             bomb.placed_time = current_time
+                            bomb.throw_target_x = None
+                            bomb.throw_target_y = None
                             thrown_bomb = None
                             is_throwing = False
         
@@ -2757,11 +4650,14 @@ def main():
         # Draw the permanent walls
         draw_walls()
         
-        # Draw the bombs
+        # Draw the bombs (non-thrown bombs only)
         draw_bombs(current_time)
         
         # Draw powerups
         draw_powerups(current_time)
+        
+        # Draw thrown bombs (after powerups so they appear in front)
+        draw_thrown_bombs(current_time)
         
         # Draw item explosion animations
         draw_item_explosions(current_time)
