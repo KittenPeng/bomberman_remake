@@ -31,3 +31,5 @@ if 1 player fies, and then the other player dies, the first player will come to 
 thrown bombs do not act correctly
 player 2 cant kick bombs
 when the match resets players will keep the effects of the speed and fire powerups
+
+test
