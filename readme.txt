@@ -10,7 +10,7 @@ P2: WASD keys to move, E to place/throw bombs
 debug keybinds:
 R: restart game
 H: show hitboxes
-I: become invinsible
+I: become invincible
 T: walk through walls
 G: give yourself the glove powerup.
 0: to activate sudden death
