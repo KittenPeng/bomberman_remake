@@ -16,13 +16,14 @@ I: become invincible
 T: walk through walls
 G: give yourself the glove powerup.
 0: to activate sudden death
+1: turn player 1 into a boss character
 
 todo:
 online multiplayer
 add bosses as playable characters?
 fix the glove
 make players trip when a bomb is thrown at their feet
-implement the skull powerdown
+implement the skull bouncing animation for when its blown up or removed from a player.
 make a proper powerup spawn table
 proper ui
 menus

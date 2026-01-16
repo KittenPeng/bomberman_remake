@@ -167,6 +167,7 @@ powerups = {}
 show_hitboxes = False  # Toggle to show hitboxes (press 'h' to toggle)
 music_muted = False  # Track whether music is muted (press 'm' to toggle)
 walk_through_walls = False  # Toggle to allow all players to walk through walls (press 't' to toggle)
+player1_using_boss_sprites = False  # Toggle to switch player 1 between normal and boss test sprites
 
 # Players will be initialized after sprite loading
 player1 = None
@@ -569,10 +570,13 @@ player_sprites = {}
 player2_sprites = {}
 player3_sprites = {}
 player4_sprites = {}
+boss_test_sprites = {}  # Boss test sprites for player 1 toggle
+boss_idle_sprites = []  # List of all sprites from row 9 for idle animation
 player_sprite_loaded = False
 player2_sprite_loaded = False
 player3_sprite_loaded = False
 player4_sprite_loaded = False
+boss_test_sprite_loaded = False
 try:
     # Suppress libpng warnings about incorrect sRGB profile
     old_stderr = sys.stderr
@@ -623,6 +627,111 @@ try:
         player_sprites[direction] = direction_sprites  # [idle, walk1, walk2]
     
     player_sprite_loaded = True
+    
+    # Load boss test sprites for player 1 toggle
+    # Boss test sprites use the same row/column structure as normal sprites
+    # These coordinates are ONLY used for boss test sprites and do NOT affect normal player sprites
+    # Boss sprites are 26x32 pixels (different from player sprites which are 16x32)
+    try:
+        boss_test_sprite_sheet = pygame.image.load(resource_path("boss test.png"))
+        # Use convert_alpha to preserve transparency better for boss sprites
+        boss_test_sprite_sheet = boss_test_sprite_sheet.convert_alpha()
+        
+        # Boss sprite dimensions: 26x32 pixels
+        BOSS_SPRITE_WIDTH = 26
+        BOSS_SPRITE_HEIGHT = 32
+        
+        # Boss test sprite coordinate mappings based on row/column structure
+        # Sprites are arranged in the same grid structure as normal sprites:
+        # Rows: up (row 1), right (row 2), down (row 3), left (row 4)
+        # Columns: idle (col 1), walk1 (col 2), walk2 (col 3)
+        # These are separate from the normal player sprite coordinates to avoid affecting normal sprites
+        boss_test_directions = {
+            'up': 0,      # Row 1: y = 0
+            'right': 32,  # Row 2: y = 32
+            'down': 64,   # Row 3: y = 64
+            'left': 96    # Row 4: y = 96
+        }
+        
+        boss_test_columns = {
+            'idle': 0,    # Column 1: x = 0
+            'walk1': 26,  # Column 2: x = 26 (boss sprites are 26 pixels wide)
+            'walk2': 52   # Column 3: x = 52
+        }
+        
+        # Get boss sprite sheet dimensions to verify layout
+        sheet_width, sheet_height = boss_test_sprite_sheet.get_size()
+        print(f"Boss test sprite sheet size: {sheet_width}x{sheet_height}")
+        print(f"Boss sprite coordinates (based on row/column structure):")
+        print(f"  Directions (Y): {boss_test_directions}")
+        print(f"  Columns (X): {boss_test_columns}")
+        print(f"  Boss sprite size: {BOSS_SPRITE_WIDTH}x{BOSS_SPRITE_HEIGHT}")
+        
+        # Load boss test sprites using boss-specific coordinate mappings
+        # Ensure we don't exceed sprite sheet bounds
+        for direction, y_offset in boss_test_directions.items():
+            direction_sprites = []
+            for frame_name, x_offset in boss_test_columns.items():
+                # Check bounds before extracting
+                if x_offset + BOSS_SPRITE_WIDTH > sheet_width or y_offset + BOSS_SPRITE_HEIGHT > sheet_height:
+                    print(f"Warning: Boss sprite extraction out of bounds for {direction}/{frame_name} at ({x_offset}, {y_offset})")
+                    # Create a blank sprite as fallback
+                    sprite = pygame.Surface((BOSS_SPRITE_WIDTH, BOSS_SPRITE_HEIGHT), pygame.SRCALPHA)
+                else:
+                    # Extract sprite region from boss test sprite sheet
+                    sprite = pygame.Surface((BOSS_SPRITE_WIDTH, BOSS_SPRITE_HEIGHT), pygame.SRCALPHA)
+                    sprite.blit(boss_test_sprite_sheet, (0, 0), (x_offset, y_offset, BOSS_SPRITE_WIDTH, BOSS_SPRITE_HEIGHT))
+                
+                # Remove chroma key green background using the helper function
+                # This ensures proper transparency for boss sprites
+                sprite = remove_chroma_key(sprite)
+                # Scale boss sprite to be 2.5x bigger (maintain aspect ratio)
+                # 26x32 becomes 65x80
+                new_width = int(BOSS_SPRITE_WIDTH * 2.5)
+                new_height = int(BOSS_SPRITE_HEIGHT * 2.5)
+                sprite = pygame.transform.scale(sprite, (new_width, new_height))
+                direction_sprites.append(sprite)
+            
+            boss_test_sprites[direction] = direction_sprites  # [idle, walk1, walk2]
+        
+        # Load idle animation sprites from row 9
+        # Row 9 is at y = 8 * 32 = 256 (assuming rows are 32 pixels apart)
+        # There are exactly 4 sprites to cycle through
+        ROW_9_Y = 8 * 32  # Row 9: y = 256
+        NUM_IDLE_SPRITES = 4  # Cycle through 4 sprites
+        x_offset = 0
+        for i in range(NUM_IDLE_SPRITES):
+            # Check bounds before extracting
+            if x_offset + BOSS_SPRITE_WIDTH > sheet_width or ROW_9_Y + BOSS_SPRITE_HEIGHT > sheet_height:
+                print(f"Warning: Boss idle sprite extraction out of bounds at ({x_offset}, {ROW_9_Y})")
+                break
+            
+            # Extract sprite from row 9
+            sprite = pygame.Surface((BOSS_SPRITE_WIDTH, BOSS_SPRITE_HEIGHT), pygame.SRCALPHA)
+            sprite.blit(boss_test_sprite_sheet, (0, 0), (x_offset, ROW_9_Y, BOSS_SPRITE_WIDTH, BOSS_SPRITE_HEIGHT))
+            
+            # Remove chroma key green background
+            sprite = remove_chroma_key(sprite)
+            # Scale boss sprite to be 2.5x bigger
+            new_width = int(BOSS_SPRITE_WIDTH * 2.5)
+            new_height = int(BOSS_SPRITE_HEIGHT * 2.5)
+            sprite = pygame.transform.scale(sprite, (new_width, new_height))
+            boss_idle_sprites.append(sprite)
+            
+            # Move to next sprite (26 pixels to the right)
+            x_offset += BOSS_SPRITE_WIDTH
+        
+        boss_test_sprite_loaded = True
+        print(f"Boss test sprites loaded successfully. Sprite keys: {list(boss_test_sprites.keys())}")
+        for direction, sprites in boss_test_sprites.items():
+            print(f"  {direction}: {len(sprites)} frames")
+        print(f"  Boss idle animation: {len(boss_idle_sprites)} frames from row 9")
+    except Exception as e:
+        boss_test_sprite_loaded = False
+        boss_idle_sprites = []  # Clear idle sprites on failure
+        print(f"Warning: Could not load boss test sprite: {e}")
+        import traceback
+        traceback.print_exc()
     
     # Load Player 2 sprites from separate file (player 2.png)
     # Use the same sprite positions as player 1 (rows 1-4)
@@ -4106,7 +4215,18 @@ def draw_player(player, current_time=None):
                 sprite = direction_sprites[frame_index]  # walk1 or walk2
             else:
                 # Use idle frame when not moving
-                sprite = direction_sprites[0]  # idle
+                # For boss sprites, cycle through row 9 idle animation only when facing down (forward)
+                if (player.player_num == 1 and player1_using_boss_sprites and boss_test_sprite_loaded 
+                    and boss_idle_sprites and player.direction == 'down'):
+                    # Cycle through 4 sprites on row 9 (200ms per frame)
+                    # Cycles: 0 -> 1 -> 2 -> 3 -> 0 -> ...
+                    if current_time:
+                        idle_frame_index = int((current_time // 200) % len(boss_idle_sprites))
+                        sprite = boss_idle_sprites[idle_frame_index]
+                    else:
+                        sprite = boss_idle_sprites[0] if boss_idle_sprites else direction_sprites[0]
+                else:
+                    sprite = direction_sprites[0]  # idle (normal directional idle for up/left/right)
             
             # Draw player sprite with bottom slightly below the hitbox bottom
             sprite_width, sprite_height = sprite.get_size()
@@ -4127,6 +4247,26 @@ def restart_music():
     try:
         pygame.mixer.music.stop()
         pygame.mixer.music.load(resource_path("Super Bomberman 2 - Battle 1 (SNES OST).mp3"))
+        # Set volume based on mute state (music is quieter at 0.5 volume)
+        if music_muted:
+            pygame.mixer.music.set_volume(0.0)
+        else:
+            pygame.mixer.music.set_volume(0.5)  # Reduced from 1.0 to 0.5 (50% volume)
+        pygame.mixer.music.play(-1)  # -1 means loop indefinitely
+    except Exception as e:
+        print(f"Warning: Could not load music: {e}")
+
+def switch_music_for_boss(is_boss_mode):
+    """Switch music between normal battle music and boss battle music"""
+    global music_muted, player1_using_boss_sprites
+    try:
+        pygame.mixer.music.stop()
+        if is_boss_mode:
+            # Load boss battle music
+            pygame.mixer.music.load(resource_path("boss fight.mp3"))
+        else:
+            # Load normal battle music
+            pygame.mixer.music.load(resource_path("Super Bomberman 2 - Battle 1 (SNES OST).mp3"))
         # Set volume based on mute state (music is quieter at 0.5 volume)
         if music_muted:
             pygame.mixer.music.set_volume(0.0)
@@ -4260,6 +4400,23 @@ def main():
                         sudden_death_hurry_animation_end_time = None
                         sudden_death_hurry_sound_state = 0
                         sudden_death_hurry_sound_start_time = None
+                elif event.key == pygame.K_1:
+                    # Toggle player 1 between normal and boss test sprites
+                    global player1_using_boss_sprites, boss_test_sprites, boss_test_sprite_loaded, player_sprites, player_sprite_loaded
+                    if not paused and player1:
+                        player1_using_boss_sprites = not player1_using_boss_sprites
+                        if player1_using_boss_sprites and boss_test_sprite_loaded:
+                            player1.sprites = boss_test_sprites
+                            print(f"Switched player 1 to boss test sprites")
+                            # Switch to boss battle music
+                            switch_music_for_boss(True)
+                        elif not player1_using_boss_sprites and player_sprite_loaded:
+                            player1.sprites = player_sprites
+                            print(f"Switched player 1 to normal sprites")
+                            # Switch back to normal battle music
+                            switch_music_for_boss(False)
+                        else:
+                            print(f"Warning: Could not switch sprites. Boss loaded: {boss_test_sprite_loaded}, Normal loaded: {player_sprite_loaded}")
                 elif event.key == pygame.K_SPACE:
                     # Player 1 bomb placement
                     if player1 and not player1.game_over:
@@ -4906,12 +5063,18 @@ def main():
                     if player1 and not player1.game_over:
                         if player1_grid_x == next_pos[0] and player1_grid_y == next_pos[1]:
                             if not player1.invincible:
+                                # Remove skull effect if player has it
+                                if remove_skull_effect(player1):
+                                    respawn_skull()
                                 player1.game_over = True
                                 player1.death_time = current_time
                     
                     if player2 and not player2.game_over:
                         if player2_grid_x == next_pos[0] and player2_grid_y == next_pos[1]:
                             if not player2.invincible:
+                                # Remove skull effect if player has it
+                                if remove_skull_effect(player2):
+                                    respawn_skull()
                                 player2.game_over = True
                                 player2.death_time = current_time
                     
@@ -4920,6 +5083,9 @@ def main():
                         player3_grid_y = int(player3.y // CELL_SIZE)
                         if player3_grid_x == next_pos[0] and player3_grid_y == next_pos[1]:
                             if not player3.invincible:
+                                # Remove skull effect if player has it
+                                if remove_skull_effect(player3):
+                                    respawn_skull()
                                 player3.game_over = True
                                 player3.death_time = current_time
                     
@@ -4928,6 +5094,9 @@ def main():
                         player4_grid_y = int(player4.y // CELL_SIZE)
                         if player4_grid_x == next_pos[0] and player4_grid_y == next_pos[1]:
                             if not player4.invincible:
+                                # Remove skull effect if player has it
+                                if remove_skull_effect(player4):
+                                    respawn_skull()
                                 player4.game_over = True
                                 player4.death_time = current_time
                     
